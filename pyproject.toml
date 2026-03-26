@@ -1,0 +1,16 @@
+[project]
+name = "yahoors"
+version = "0.1.0"
+description = "A python wrapper for Yahoo Finance using rust for the backend."
+authors = [{ name = "William Kruta", email = "wjkruta@gmail.com" }]
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "duckdb==1.5.1",
+    "pandas==3.0.1",
+    "polars==1.39.3",
+    "pyarrow==23.0.1",
+    "yfinance==1.2.0",
+]
+[project.scripts]
+yahoors = "YahooRS.cli:main"
