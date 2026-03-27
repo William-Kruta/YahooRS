@@ -17,9 +17,56 @@ class Statements:
             self.candles = candles_obj
         self.table_name = "statements"
 
+    def get_income_statement(self, tickers: list, period: str) -> pl.DataFrame:
+        """
+        tickers: list, List of tickers to search. Will be converted to a list if single string is passed.
+        period: str, Period of financial statements. 'A' for annual and 'Q' for quarterly.
+
+        returns: pl.DataFrame, Dataframe containing the financial statement.
+        """
+        if isinstance(tickers, str):
+            tickers = [tickers]
+        df = self.get_statement(
+            tickers, statement="income_statement", period=period.upper()
+        )
+        return df
+
+    def get_balance_sheet(self, tickers: list, period: str):
+        """
+        tickers: list, List of tickers to search. Will be converted to a list if single string is passed.
+        period: str, Period of financial statements. 'A' for annual and 'Q' for quarterly.
+
+        returns: pl.DataFrame, Dataframe containing the financial statement.
+        """
+        if isinstance(tickers, str):
+            tickers = [tickers]
+        df = self.get_statement(
+            tickers, statement="balance_sheet", period=period.upper()
+        )
+        return df
+
+    def get_cash_flow(self, tickers: list, period: str):
+        """
+        tickers: list, List of tickers to search. Will be converted to a list if single string is passed.
+        period: str, Period of financial statements. 'A' for annual and 'Q' for quarterly.
+
+        returns: pl.DataFrame, Dataframe containing the financial statement.
+        """
+        if isinstance(tickers, str):
+            tickers = [tickers]
+        df = self.get_statement(tickers, statement="cash_flow", period=period.upper())
+        return df
+
     def get_statement(
         self, tickers: list[str], statement: str, period: str = "A"
     ) -> pl.DataFrame:
+        """
+        tickers: list, List of tickers to search. Will be converted to a list if single string is passed.
+        statement: str, key value of the statements, accepted values are ["balance_sheet", "cash_flow", "income_statement"]
+        period: str, Period of financial statements. 'A' for annual and 'Q' for quarterly.
+
+        returns: pl.DataFrame, Dataframe containing the financial statement.
+        """
         if isinstance(tickers, str):
             tickers = [tickers]
         tickers = clean_tickers(tickers)
@@ -28,6 +75,7 @@ class Statements:
         if df.is_empty():
             for ticker in tickers:
                 fresh = self._download_statements(ticker, statement, period)
+                fresh = fresh.fill_null(0)
                 self._insert_statements(fresh)
         else:
             db_tickers = df["ticker"].unique().to_list()
@@ -59,20 +107,36 @@ class Statements:
 
         # Reverse the date columns (everything after ticker and label)
         if period.upper() == "A":
-            df = df.with_columns(
-                pl.col("date").str.to_date("%Y-%m-%d %H:%M:%S").dt.year().alias("year")
-            )
+            try:
+                df = df.with_columns(
+                    pl.col("date")
+                    .str.to_date("%Y-%m-%d %H:%M:%S")
+                    .dt.year()
+                    .alias("year")
+                )
+            except pl.exceptions.SchemaError:
+                df = df.with_columns(pl.col("date").dt.year().alias("year"))
             pivoted = df.pivot(on="year", index=["ticker", "label"], values="value")
         elif period.upper() == "Q":
-            df = df.with_columns(
-                pl.col("date")
-                .str.to_datetime("%Y-%m-%d %H:%M:%S")
-                .map_elements(
-                    lambda d: f"{d.year}-Q{(d.month - 1) // 3 + 1}",
-                    return_dtype=pl.Utf8,
+            try:
+                df = df.with_columns(
+                    pl.col("date")
+                    .str.to_datetime("%Y-%m-%d %H:%M:%S")
+                    .map_elements(
+                        lambda d: f"{d.year}-Q{(d.month - 1) // 3 + 1}",
+                        return_dtype=pl.Utf8,
+                    )
+                    .alias("quarter")
                 )
-                .alias("quarter")
-            )
+            except pl.exceptions.SchemaError:
+                df = df.with_columns(
+                    pl.col("date")
+                    .map_elements(
+                        lambda d: f"{d.year}-Q{(d.month - 1) // 3 + 1}",
+                        return_dtype=pl.Utf8,
+                    )
+                    .alias("quarter")
+                )
             pivoted = df.pivot(on="quarter", index=["ticker", "label"], values="value")
         fixed_cols = ["ticker", "label"]
         date_cols = [c for c in pivoted.columns if c not in fixed_cols]

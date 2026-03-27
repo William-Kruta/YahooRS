@@ -25,13 +25,11 @@ class Options:
     ) -> pl.DataFrame:
         tickers = clean_tickers(tickers)
         df = self._read_options(tickers, get_latest=get_latest)
-        print(f"DF: {df}")
 
         if df.is_empty() or force_update:
             fresh = self._download_options(
                 tickers, expirations=expirations, get_latest=get_latest
             )
-            print(f"FRESH: {fresh}")
             self._insert_options(fresh)
         else:
             # Check staleness per ticker based on most recent collected_at
@@ -53,7 +51,6 @@ class Options:
                     cached_tickers.append(ticker)
 
             missing_tickers = list_difference(cached_tickers + stale_tickers, tickers)
-            print(f"MISSING: {missing_tickers}")
             if stale_tickers:
                 fresh = self._download_options(
                     stale_tickers, expirations=expirations, get_latest=get_latest
@@ -99,12 +96,10 @@ class Options:
                         puts["stock_price"] = last_price
                         data.append(calls)
                         data.append(puts)
-                    except ValueError as e:
-                        print(f"[{t}]  {e}")
+                    except ValueError:
                         continue
-            except Exception as e:
+            except Exception:
                 break
-                print(f"E: {e}")
         df = pl.from_pandas(pd.concat(data))
         df = df.with_columns(
             pl.lit(dt.datetime.now(dt.timezone.utc)).alias("collected_at")
@@ -122,7 +117,6 @@ class Options:
 
         df = add_greeks_to_df(df, risk_free_rate=risk_free_rate)
         df = self.calculate_historical_probs(df, self.candles.get_candles(tickers))
-        print(f"DF2: {df}")
         df = df.rename(
             {
                 "contractSymbol": "contract_symbol",

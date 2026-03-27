@@ -25,14 +25,9 @@ class Candles:
             tickers = [tickers]
         tickers = clean_tickers(tickers)
         df = self._read_candles(tickers, interval)
-        print(f"Local: {df}")
-
-        if self.debug:
-            print(f"Local: {df.shape}")
 
         if df.is_empty():
             fresh = self._download_candles(tickers, interval, period)
-            print(f"Fresh1: {fresh}")
             self._insert_candles(fresh)
             return self._read_candles(tickers, interval)
 
@@ -49,20 +44,21 @@ class Candles:
             if (now - latest) > stale_threshold:
                 needs_refresh = True
                 start_date = latest.strftime("%Y-%m-%d")
-                if self.debug:
-                    print(f"Stale: {ticker} (last: {start_date})")
-                fresh = self._download_candles([ticker], interval, start=start_date)
-                print(f"Fresh: {fresh}")
+                fresh = self._download_candles(
+                    [ticker], interval, start=start_date, end=now
+                )
                 self._insert_candles(fresh)
 
         if missing_tickers:
             needs_refresh = True
-            if self.debug:
-                print(f"Missing: {missing_tickers}")
             fresh = self._download_candles(missing_tickers, interval, period)
             self._insert_candles(fresh)
 
-        return self._read_candles(tickers, interval) if needs_refresh else df
+        return (
+            self._read_candles(tickers, interval).sort(by="date")
+            if needs_refresh
+            else df
+        )
 
     def get_last_price(self, tickers: list[str]) -> dict[str, float]:
         if isinstance(tickers, str):
@@ -109,8 +105,6 @@ class Candles:
         start: str = None,
         end: str = None,
     ) -> pl.DataFrame:
-        if self.debug:
-            print(f"Downloading: {tickers}")
         if isinstance(tickers, str):
             tickers = [tickers]
         tickers = clean_tickers(tickers)
@@ -122,7 +116,6 @@ class Candles:
 
         # Download with error handling
         data = yf.download(tickers, interval=interval, **params)
-        print(f"Data: {data}")
         if data.empty:
             # If batch failed, try individual downloads to salvage what we can
             if len(tickers) > 1:
@@ -135,11 +128,8 @@ class Candles:
                             if "Ticker" not in single.columns:
                                 single["Ticker"] = ticker
                             frames.append(single)
-                        elif self.debug:
-                            print(f"Skipping {ticker}: no data")
-                    except Exception as e:
-                        if self.debug:
-                            print(f"Failed {ticker}: {e}")
+                    except Exception:
+                        pass
                 if not frames:
                     return pl.DataFrame()
                 data = pd.concat(frames)
@@ -174,7 +164,7 @@ class Candles:
 
     def _read_candles(self, tickers: list[str], interval: str) -> pl.DataFrame:
         return self.conn.execute(
-            "SELECT * FROM candles WHERE ticker = ANY($1) AND interval = $2",
+            "SELECT * FROM candles WHERE ticker = ANY($1) AND interval = $2 ORDER BY date, ticker",
             [tickers, interval],
         ).pl()
 
@@ -223,8 +213,6 @@ class Candles:
             conn=self.conn,
             pk_cols=["date", "ticker", "interval"],
         )
-        if self.debug:
-            print(f"Inserted {len(df)} records")
 
     @staticmethod
     def _parse_date(date_val) -> dt.datetime:

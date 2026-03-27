@@ -43,7 +43,8 @@ class Tickers:
         first_prices = self.candles.get_first_price(
             tickers, select_col="date", alias="value"
         )
-
+        latest_prices = self.candles.get_last_price(tickers)
+        print(f"LATEST: {latest_prices}")
         data = []
         for t in tickers:
             try:
@@ -68,8 +69,7 @@ class Tickers:
                         "asset_type": info.get("quoteType"),
                     }
                 )
-            except Exception as e:
-                print(f"Error: {e}")
+            except Exception:
                 break
 
         df = pl.DataFrame(data)
@@ -82,10 +82,6 @@ class Tickers:
         return self.conn.execute(
             "SELECT * FROM company_info WHERE symbol = ANY($1)", [tickers]
         ).pl()
-        # return self.conn.execute(
-        #     "SELECT * FROM candles WHERE ticker = ANY($1) AND interval = $2",
-        #     [tickers, interval],
-        # ).pl()
 
     def _insert_ticker_info(self, df: pl.DataFrame):
         if df.is_empty():
@@ -112,7 +108,13 @@ class Tickers:
             pk_cols=["symbol"],
         )
 
-    def read_from_csv(self, csv_path: str, symbol_col: str, exclude: list = []):
+    def read_from_csv(
+        self,
+        csv_path: str,
+        symbol_col: str,
+        exclude: list = [],
+        filter_status: bool = False,
+    ):
         df = pl.read_csv(csv_path)
 
         tickers = df[symbol_col].to_list()
@@ -120,7 +122,20 @@ class Tickers:
         tickers = [t for t in tickers if t not in bad_values]
         tickers = clean_tickers(tickers)
         tickers = [t for t in tickers if t not in exclude]
+        if filter_status:
+            return (
+                self.conn.execute(
+                    f"SELECT * FROM {self.table_name} WHERE symbol = ANY($1) AND trading_status = True",
+                    [tickers],
+                )
+                .pl()["symbol"]
+                .to_list()
+            )
         return tickers
+
+    def _read_trading_status(self, ticker: str):
+        query = f"SELECT trading_status FROM {self.table_name} WHERE symbol = ?"
+        return self.conn.execute(query=query, parameters=[ticker])
 
     def read_from_text_file(self, file_path: str) -> list:
         with open(file_path, "r") as file:

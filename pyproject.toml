@@ -6,11 +6,27 @@ authors = [{ name = "William Kruta", email = "wjkruta@gmail.com" }]
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "duckdb==1.5.1",
-    "pandas==3.0.1",
-    "polars==1.39.3",
-    "pyarrow==23.0.1",
-    "yfinance==1.2.0",
+    "duckdb>=1.5.1",
+    "pandas>=3.0.1",
+    "polars>=1.39.3",
+    "pyarrow>=23.0.1",
+    "yfinance>=1.2.0",
 ]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+keywords = ["finance", "yahoo", "options", "candles", "duckdb", "polars"]
 [project.scripts]
-yahoors = "YahooRS.cli:main"
+yahoors = "yahoors.cli:main"
+[project.urls]
+Homepage = "https://github.com/William-Kruta/YahooRS"
+"Bug Tracker" = "https://github.com/William-Kruta/YahooRS/issues"
+"Source Code" = "https://github.com/William-Kruta/YahooRS"
+
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
