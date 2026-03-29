@@ -2,3 +2,4 @@ duckdb
 yfinance
 polars
 pyarrow
+lxml

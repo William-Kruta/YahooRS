@@ -72,6 +72,43 @@ def _init_tables(db_path: str = None) -> duckdb.DuckDBPyConnection:
             trading_status    BOOLEAN,
             updated_at        TIMESTAMPTZ NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS earnings_dates (
+            earnings_date   TIMESTAMPTZ NOT NULL,
+            ticker          VARCHAR     NOT NULL,
+            eps_estimate    DOUBLE,
+            reported_eps    DOUBLE,
+            surprise_pct    DOUBLE,
+            PRIMARY KEY (earnings_date, ticker)
+        );
+
+        CREATE TABLE IF NOT EXISTS earnings_estimates (
+            period              VARCHAR NOT NULL,
+            ticker              VARCHAR NOT NULL,
+            avg                 DOUBLE,
+            low                 DOUBLE,
+            high                DOUBLE,
+            year_ago_eps        DOUBLE,
+            number_of_analysts  INTEGER,
+            growth              DOUBLE,
+            label               VARCHAR,
+            period_label        VARCHAR,
+            collected_at        TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (period, ticker, collected_at)
+        );
+
+        CREATE TABLE IF NOT EXISTS earnings_history (
+            quarter         TIMESTAMP   NOT NULL,
+            ticker          VARCHAR     NOT NULL,
+            eps_actual      DOUBLE,
+            eps_estimate    DOUBLE,
+            eps_difference  DOUBLE,
+            surprise_pct    DOUBLE,
+            PRIMARY KEY (quarter, ticker)
+        );
+
+
+
     """
     )
     return conn
