@@ -106,6 +106,12 @@ class Statements:
         pivoted = df.pivot(on="date", index=["ticker", "label"], values="value")
 
         # Reverse the date columns (everything after ticker and label)
+        def quarter_end(d):
+            q = (d.month - 1) // 3 + 1
+            end_month = q * 3
+            last_day = {3: 31, 6: 30, 9: 30, 12: 31}[end_month]
+            return f"{d.year}-{end_month:02d}-{last_day:02d}"
+
         if period.upper() == "A":
             try:
                 df = df.with_columns(
@@ -116,25 +122,22 @@ class Statements:
                 )
             except pl.exceptions.SchemaError:
                 df = df.with_columns(pl.col("date").dt.year().alias("year"))
+            df = df.with_columns(
+                (pl.col("year").cast(pl.Utf8) + "-12-31").alias("year")
+            )
             pivoted = df.pivot(on="year", index=["ticker", "label"], values="value")
         elif period.upper() == "Q":
             try:
                 df = df.with_columns(
                     pl.col("date")
                     .str.to_datetime("%Y-%m-%d %H:%M:%S")
-                    .map_elements(
-                        lambda d: f"{d.year}-Q{(d.month - 1) // 3 + 1}",
-                        return_dtype=pl.Utf8,
-                    )
+                    .map_elements(quarter_end, return_dtype=pl.Utf8)
                     .alias("quarter")
                 )
             except pl.exceptions.SchemaError:
                 df = df.with_columns(
                     pl.col("date")
-                    .map_elements(
-                        lambda d: f"{d.year}-Q{(d.month - 1) // 3 + 1}",
-                        return_dtype=pl.Utf8,
-                    )
+                    .map_elements(quarter_end, return_dtype=pl.Utf8)
                     .alias("quarter")
                 )
             pivoted = df.pivot(on="quarter", index=["ticker", "label"], values="value")
@@ -257,6 +260,8 @@ class Statements:
         candles_df: pl.DataFrame = None,
         period: str = "A",
     ) -> pl.DataFrame:
+        if isinstance(tickers, str):
+            tickers = [tickers]
         if income_df is None:
             income_df = self.get_statement(tickers, "income_statement", period=period)
         if balance_sheet_df is None:
@@ -272,19 +277,38 @@ class Statements:
         date_cols_bs = [
             c for c in balance_sheet_df.columns if c not in ("ticker", "label")
         ]
-
+        # Income Statement
         REVENUE = "Total Revenue"
+        COGS = "Cost Of Revenue"
         NET_INCOME = "Net Income Common Stockholders"
         EBITDA = "EBITDA"
         SHARES = "Diluted Average Shares"
+        # Balance Sheet 
         TOTAL_DEBT = "Total Debt"
+        AR = "Accounts Receivable"
+        AP = "Accounts Payable"
+        TOTAL_ASSETS = "Total Assets"
         STOCKHOLDERS_EQUITY = "Stockholders Equity"
         CURRENT_ASSETS = "Current Assets"
         CURRENT_LIABILITIES = "Current Liabilities"
         TANGIBLE_BOOK_VALUE = "Tangible Book Value"
-
-        # Annualization factor: quarterly values need to be multiplied by 4
-        annualize = 4 if period == "Q" else 1
+        CASH_AND_CASH_EQUIVALENTS = "Cash And Cash Equivalents"
+        INVENTORY = "Inventory"
+        avg_values = {}
+        yf_keys = [REVENUE, COGS, NET_INCOME, EBITDA, INVENTORY, AR, AP]
+        if period == "Q":
+            for ticker in tickers:
+                bs = balance_sheet_df.filter(pl.col("ticker") == ticker)
+                for key in yf_keys:
+                    inv_row = bs.filter(pl.col("label") == key)
+                    if not inv_row.is_empty():
+                        vals = inv_row.select(date_cols_bs).row(0)
+                        dates = date_cols_bs
+                        rolling = {}
+                        for i, d in enumerate(dates):
+                            window = [v for v in vals[max(0, i - 3):i + 1] if v is not None]
+                            rolling[d] = sum(window) / len(window) if window else None
+                        avg_values[(ticker, key.lower())] = rolling
 
         results = []
 
@@ -344,13 +368,53 @@ class Statements:
                 current_assets = get_val(bs, CURRENT_ASSETS, date_col)
                 current_liabilities = get_val(bs, CURRENT_LIABILITIES, date_col)
                 book_value = get_val(bs, TANGIBLE_BOOK_VALUE, date_col)
+                cash_and_cash_equivalents = get_val(bs, CASH_AND_CASH_EQUIVALENTS, date_col)
+                inventory = (
+                    avg_values.get((ticker, "inventory"), {}).get(date_col)
+                    if period == "Q"
+                    else get_val(bs, INVENTORY, date_col)
+                )
+                if inventory is None:
+                    inventory = 0
+                ar = (
+                    avg_values.get((ticker, "accounts receivable"), {}).get(date_col)
+                    if period == "Q"
+                    else get_val(bs, AR, date_col)
+                )
+                ap = (
+                    avg_values.get((ticker, "accounts payable"), {}).get(date_col)
+                    if period == "Q"
+                    else get_val(bs, AP, date_col)
+                )
+                   
+
 
                 price = get_closest_price(date_col)
 
                 # Annualize flow metrics for quarterly data
-                ann_revenue = revenue * annualize if revenue else None
-                ann_net_income = net_income * annualize if net_income else None
-                ann_ebitda = ebitda * annualize if ebitda else None
+                ann_revenue = (
+                    avg_values.get((ticker, "revenue"), {}).get(date_col)
+                    if period == "Q"
+                    else get_val(inc, REVENUE, date_col)
+                )
+                ann_cogs = (
+                    avg_values.get((ticker, "cogs"), {}).get(date_col)
+                    if period == "Q"
+                    else get_val(inc, COGS, date_col)
+                )
+                #ann_revenue = revenue * annualize if revenue else None
+                ann_net_income = (
+                    avg_values.get((ticker, "net_income"), {}).get(date_col)
+                    if period == "Q"
+                    else get_val(inc, NET_INCOME, date_col)
+                )
+                #ann_net_income = net_income * annualize if net_income else None
+                ann_ebitda = (
+                    avg_values.get((ticker, "ebitda"), {}).get(date_col)
+                    if period == "Q"
+                    else get_val(inc, EBITDA, date_col)
+                )
+                #ann_ebitda = ebitda * annualize if ebitda else None
 
                 # P/E
                 if price and shares and ann_net_income:
@@ -426,7 +490,69 @@ class Statements:
                             "value": current_assets / current_liabilities,
                         }
                     )
+                # Quick Ratio (balance sheet items, no annualization)
+                if current_assets and current_liabilities:
+                    results.append(
+                        {
+                            "ticker": ticker,
+                            "date": date_col,
+                            "ratio_name": "Quick Ratio",
+                            "value": (current_assets - inventory) / current_liabilities,
+                        }
+                    )
+                # Cash Ratio (balance sheet items, no annualization)
+                if cash_and_cash_equivalents and current_liabilities:
+                    results.append(
+                        {
+                            "ticker": ticker,
+                            "date": date_col,
+                            "ratio_name": "Cash Ratio",
+                            "value": cash_and_cash_equivalents / current_liabilities,
+                        }
+                    )
 
+                # Working Capital (balance sheet items, no annualization)
+                if current_assets and current_liabilities:
+                    results.append(
+                        {
+                            "ticker": ticker,
+                            "date": date_col,
+                            "ratio_name": "Working Capital",
+                            "value": current_assets - current_liabilities,
+                        }
+                    )
+
+                # Asset Turnover (annualize revenue, inventory is point-in-time)
+                if ann_revenue and inventory:
+                    results.append(
+                        {
+                            "ticker": ticker,
+                            "date": date_col,
+                            "ratio_name": "Asset Turnover",
+                            "value": ann_revenue / inventory,
+                        }
+                    ) 
+
+                # Inventory Turnover (annualize revenue, inventory is point-in-time)
+                if ann_cogs and inventory:
+                    results.append(
+                        {
+                            "ticker": ticker,
+                            "date": date_col,
+                            "ratio_name": "Inventory Turnover",
+                            "value": ann_cogs / inventory,
+                        }
+                    )   
+                # Recievables Turnover 
+                if ann_revenue and ar:
+                    results.append(
+                        {
+                            "ticker": ticker,
+                            "date": date_col,
+                            "ratio_name": "Recievables Turnover",
+                            "value": ann_revenue / ar,
+                        }
+                    )
                 # ROE (annualize net income, equity is point-in-time)
                 if ann_net_income and equity:
                     results.append(
@@ -437,5 +563,236 @@ class Statements:
                             "value": ann_net_income / equity,
                         }
                     )
+
+                # Days Sales Outstanding
+                if ann_revenue and ar:
+                    receivables_turnover = ann_revenue / ar
+                    results.append(
+                        {
+                            "ticker": ticker,
+                            "date": date_col,
+                            "ratio_name": "DSO",
+                            "value": 365 / receivables_turnover,
+                        }
+                    )
+
+                # Days Inventory Outstanding
+                if ann_cogs and inventory:
+                    inventory_turnover = ann_cogs / inventory
+                    results.append(
+                        {
+                            "ticker": ticker,
+                            "date": date_col,
+                            "ratio_name": "DIO",
+                            "value": 365 / inventory_turnover,
+                        }
+                    )
+
+                # Days Payable Outstanding & Cash Conversion Cycle
+                if ann_cogs and ap:
+                    dpo = (ap / ann_cogs) * 365
+                    results.append(
+                        {
+                            "ticker": ticker,
+                            "date": date_col,
+                            "ratio_name": "DPO",
+                            "value": dpo,
+                        }
+                    )
+                    # CCC requires all three components
+                    if ann_revenue and ar and inventory:
+                        dso = (ar / ann_revenue) * 365
+                        dio = (inventory / ann_cogs) * 365
+                        results.append(
+                            {
+                                "ticker": ticker,
+                                "date": date_col,
+                                "ratio_name": "Cash Conversion Cycle",
+                                "value": dso + dio - dpo,
+                            }
+                        )
+
+        return pl.DataFrame(results)
+
+
+
+    def get_per_share(self, tickers: list[str], period: str = "A"):
+        income_statement = self.get_statement(
+            tickers=tickers, statement="income_statement", period=period
+        )
+        balance_sheet = self.get_statement(
+            tickers=tickers, statement="balance_sheet", period=period
+        )
+        cash_flow = self.get_statement(
+            tickers=tickers, statement="cash_flow", period=period
+        )
+        date_cols = [c for c in income_statement.columns if c not in ("ticker", "label")]
+        SHARES = "Diluted Average Shares"
+        per_share_map = {
+            "revenue_per_share": ("Total Revenue", SHARES, "income_statement"),
+            "operating_income_per_share": ("Operating Income", SHARES, "income_statement"),
+            "net_income_per_share": (
+                "Net Income", 
+                SHARES, "income_statement"
+            ),
+            "ebitda_per_share": ("EBITDA", SHARES, "income_statement"),
+            # Balance Sheet 
+            "cash_per_share": ("Cash and Cash Equivalents", SHARES, "balance_sheet"),
+            "debt_per_share": ("Total Debt", SHARES, "balance_sheet"),
+            "equity_per_share": ("Total Equity", SHARES, "balance_sheet"),
+            # Cash Flow
+            "fcf_per_share": ("Free Cash Flow", SHARES, "cash_flow"),
+        }
+
+        results = []
+
+        for ticker in income_statement["ticker"].unique().to_list():
+            ticker_inc_df = income_statement.filter(pl.col("ticker") == ticker)
+            ticker_bal_df = balance_sheet.filter(pl.col("ticker") == ticker)
+            ticker_cf_df = cash_flow.filter(pl.col("ticker") == ticker)
+
+            for per_share_label, (numerator_label, denominator_label, statement) in per_share_map.items():
+                den_row = ticker_inc_df.filter(pl.col("label") == denominator_label)
+                if statement == "income_statement":
+                    num_row = ticker_inc_df.filter(pl.col("label") == numerator_label)
+                    
+                elif statement == "balance_sheet":
+                    num_row = ticker_bal_df.filter(pl.col("label") == numerator_label)
+                elif statement == "cash_flow":
+                    num_row = ticker_cf_df.filter(pl.col("label") == numerator_label)
+
+                if num_row.is_empty() or den_row.is_empty():
+                    continue
+
+                for date_col in date_cols:
+                    num = num_row[date_col].item()
+                    den = den_row[date_col].item()
+
+                    if num is not None and den is not None and den != 0:
+                        results.append(
+                            {
+                                "ticker": ticker,
+                                "date": date_col,
+                                "per_share_label": per_share_label,
+                                "value": num / den,
+                            }
+                        )
+
+        return pl.DataFrame(results)
+        
+
+    def get_growth_values(self, tickers: list[str], period: str = "A"):
+        income_statement = self.get_statement(
+            tickers=tickers, statement="income_statement", period=period
+        )
+        balance_sheet = self.get_statement(
+            tickers=tickers, statement="balance_sheet", period=period
+        )
+        cash_flow = self.get_statement(
+            tickers=tickers, statement="cash_flow", period=period
+        )
+        date_cols = [c for c in income_statement.columns if c not in ("ticker", "label")]
+
+        growth_labels = {
+            # Income Statement
+            "Revenue Growth": ("income", "Total Revenue"),
+            "Net Income Growth": ("income", "Net Income Common Stockholders"),
+            "EBITDA Growth": ("income", "EBITDA"),
+            "Operating Income Growth": ("income", "Operating Income"),
+            "EPS Growth": ("income", "Diluted EPS"),
+            # Balance Sheet
+            "Cash Growth": ("balance", "Cash And Cash Equivalents"),
+            "Debt Growth": ("balance", "Total Debt"),
+            "Equity Growth": ("balance", "Stockholders Equity"),
+            "Total Assets Growth": ("balance", "Total Assets"),
+            # Cash Flow
+            "Operating Cash Flow Growth": ("cashflow", "Operating Cash Flow"),
+            "Capex Growth": ("cashflow", "Capital Expenditure"),
+            "Dividend Growth": ("cashflow", "Common Stock Dividend Paid"),
+        }
+
+        source_map = {
+            "income": income_statement,
+            "balance": balance_sheet,
+            "cashflow": cash_flow,
+        }
+
+        # For quarterly: compare to same quarter last year (4 periods back)
+        # For annual: compare to prior year (1 period back)
+        lookback = 4 if period == "Q" else 1
+
+        results = []
+
+        for ticker in tickers:
+            for growth_name, (source, label) in growth_labels.items():
+                df = source_map[source]
+                row = df.filter(
+                    (pl.col("ticker") == ticker) & (pl.col("label") == label)
+                )
+                if row.is_empty():
+                    continue
+
+                for i in range(lookback, len(date_cols)):
+                    current_col = date_cols[i]
+                    prior_col = date_cols[i - lookback]
+
+                    current_val = row[current_col].item()
+                    prior_val = row[prior_col].item()
+
+                    if current_val is None or prior_val is None or prior_val == 0:
+                        continue
+
+                    growth = (current_val - prior_val) / abs(prior_val)
+
+                    results.append(
+                        {
+                            "ticker": ticker,
+                            "date": current_col,
+                            "label": growth_name,
+                            "value": growth,
+                        }
+                    )
+
+        # Add FCF Growth (computed from two cash flow items)
+        for ticker in tickers:
+            ocf_row = cash_flow.filter(
+                (pl.col("ticker") == ticker)
+                & (pl.col("label") == "Operating Cash Flow")
+            )
+            capex_row = cash_flow.filter(
+                (pl.col("ticker") == ticker)
+                & (pl.col("label") == "Capital Expenditure")
+            )
+            if ocf_row.is_empty() or capex_row.is_empty():
+                continue
+
+            for i in range(lookback, len(date_cols)):
+                current_col = date_cols[i]
+                prior_col = date_cols[i - lookback]
+
+                ocf_curr = ocf_row[current_col].item()
+                capex_curr = capex_row[current_col].item()
+                ocf_prior = ocf_row[prior_col].item()
+                capex_prior = capex_row[prior_col].item()
+
+                if any(v is None for v in [ocf_curr, capex_curr, ocf_prior, capex_prior]):
+                    continue
+
+                fcf_curr = ocf_curr - abs(capex_curr)
+                fcf_prior = ocf_prior - abs(capex_prior)
+
+                if fcf_prior == 0:
+                    continue
+
+                growth = (fcf_curr - fcf_prior) / abs(fcf_prior)
+
+                results.append(
+                    {
+                        "ticker": ticker,
+                        "date": current_col,
+                        "label": "FCF Growth",
+                        "value": growth,
+                    }
+                )
 
         return pl.DataFrame(results)

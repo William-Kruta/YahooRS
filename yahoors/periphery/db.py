@@ -22,6 +22,24 @@ def _init_tables(db_path: str = None) -> duckdb.DuckDBPyConnection:
             PRIMARY KEY (date, ticker, interval)
         );
 
+        CREATE TABLE IF NOT EXISTS dividends (
+            date        TIMESTAMP   NOT NULL,
+            ticker      VARCHAR     NOT NULL,
+            dividend    DOUBLE      NOT NULL,
+            ttm_dividend DOUBLE      NOT NULL,
+            close       DOUBLE      NOT NULL,
+            dividend_yield_pct DOUBLE      NOT NULL,
+            PRIMARY KEY (date, ticker)
+        );
+
+        CREATE TABLE IF NOT EXISTS dividend_info (
+            ticker          VARCHAR     NOT NULL,
+            frequency       INTEGER     NOT NULL,
+            status          BOOLEAN     NOT NULL,
+            updated_at      TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (ticker)
+        );
+        
         CREATE TABLE IF NOT EXISTS options (
             contract_symbol    VARCHAR     NOT NULL,
             last_trade_date    TIMESTAMPTZ NOT NULL,

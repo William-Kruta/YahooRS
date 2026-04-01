@@ -6,7 +6,7 @@ import datetime as dt
 
 from ..periphery.db import _init_tables, insert_data
 from ..periphery.utils import clean_tickers, list_difference
-
+from ..periphery.stale import get_stale_threshold
 
 class Candles:
     def __init__(self, db_path: str = None, debug: bool = True):
@@ -19,8 +19,10 @@ class Candles:
         tickers: list[str],
         interval: str = "1d",
         period: str = "max",
-        stale_threshold: dt.timedelta = dt.timedelta(hours=36),
+        stale_threshold: dt.timedelta = None,
     ) -> pl.DataFrame:
+        if stale_threshold is None:
+            stale_threshold = get_stale_threshold(interval)
         if isinstance(tickers, str):
             tickers = [tickers]
         tickers = clean_tickers(tickers)
@@ -60,27 +62,20 @@ class Candles:
             else df
         )
 
-    def get_last_price(self, tickers: list[str]) -> dict[str, float]:
+    def get_last_price(
+        self, tickers: list[str], select_col: str = "close", alias: str = "value"
+    ) -> dict[str, float]:
         if isinstance(tickers, str):
             tickers = [tickers]
         tickers = clean_tickers(tickers)
 
-        # Try lightweight SQL query first
-        prices = self._get_latest_prices(tickers)
-
-        # Fall back to full get_candles for any missing tickers
-        missing = [t for t in tickers if t not in prices]
-        if missing:
-            df = self.get_candles(missing)
-            rows = (
-                df.sort("date")
-                .group_by("ticker")
-                .agg(pl.col("close").last().alias("price"))
-                .iter_rows()
-            )
-            prices.update({ticker: price for ticker, price in rows})
-
-        return prices
+        df = self.get_candles(tickers)
+        rows = (
+            df.group_by("ticker")
+            .agg(pl.col(select_col).sort_by("date").last().alias(alias))
+            .iter_rows()
+        )
+        return {ticker: price for ticker, price in rows}
 
     def get_first_price(
         self, tickers: list[str], select_col: str = "close", alias: str = "value"
