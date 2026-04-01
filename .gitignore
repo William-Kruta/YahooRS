@@ -11,3 +11,6 @@ wheels/
 
 # Test scripts 
 test.py
+
+# Other 
+chart.html 
