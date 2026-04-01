@@ -14,10 +14,10 @@ def _init_tables(db_path: str = None) -> duckdb.DuckDBPyConnection:
             date        TIMESTAMP   NOT NULL,
             ticker      VARCHAR     NOT NULL,
             interval    VARCHAR     NOT NULL,
-            close       DOUBLE,
             open        DOUBLE,
-            low         DOUBLE,
             high        DOUBLE,
+            low         DOUBLE,
+            close       DOUBLE,
             volume      DOUBLE,
             PRIMARY KEY (date, ticker, interval)
         );

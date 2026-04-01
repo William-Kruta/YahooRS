@@ -8,6 +8,7 @@ from ..periphery.db import _init_tables, insert_data
 from ..periphery.utils import clean_tickers, list_difference
 from ..periphery.stale import get_stale_threshold
 
+
 class Candles:
     def __init__(self, db_path: str = None, debug: bool = True):
         self.conn = _init_tables(db_path)
@@ -142,16 +143,18 @@ class Candles:
 
         df = pl.from_pandas(data)
         df = df.rename({c: c.lower() for c in df.columns})
-        df = df.drop_nulls(subset=["close", "open", "low", "high", "volume", "ticker"])
+        df = df.drop_nulls(subset=["open", "high", "low", "close", "volume", "ticker"])
+        if "datetime" in df.columns:
+            df = df.rename({"datetime": "date"})
 
         target_cols = [
             "date",
             "ticker",
             "interval",
-            "close",
             "open",
-            "low",
             "high",
+            "low",
+            "close",
             "volume",
         ]
         cols_to_select = [c for c in target_cols if c in df.columns]
@@ -195,10 +198,10 @@ class Candles:
             "date",
             "ticker",
             "interval",
-            "close",
             "open",
-            "low",
             "high",
+            "low",
+            "close",
             "volume",
         ]
         insert_data(

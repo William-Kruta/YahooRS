@@ -4,5 +4,15 @@ from .modules.statements import Statements
 from .modules.earnings import Earnings
 from .modules.tickers import Ticker, BatchTickers
 from .modules.dividends import Dividends
+from .modules.socket import WebSocket
 
-__all__ = ["Candles", "Options", "Statements", "Earnings", "Ticker", "BatchTickers", "Dividends"]
+__all__ = [
+    "Candles",
+    "Options",
+    "Statements",
+    "Earnings",
+    "Ticker",
+    "BatchTickers",
+    "Dividends",
+    "WebSocket",
+]
