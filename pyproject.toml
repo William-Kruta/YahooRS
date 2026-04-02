@@ -1,6 +1,6 @@
 [project]
 name = "yahoors"
-version = "0.1.3"
+version = "0.1.4"
 description = "A python wrapper for Yahoo Finance using rust for the backend."
 authors = [{ name = "William Kruta", email = "wjkruta@gmail.com" }]
 readme = "README.md"
@@ -8,10 +8,13 @@ requires-python = ">=3.12"
 dependencies = [
     "build>=1.4.2",
     "duckdb>=1.5.1",
+    "fastapi>=0.116.1",
+    "httpx>=0.28.1",
     "pandas>=3.0.1",
     "polars>=1.39.3",
     "pyarrow>=23.0.1",
     "twine>=6.2.0",
+    "uvicorn>=0.35.0",
     "yfinance>=1.2.0",
 ]
 classifiers = [
@@ -23,6 +26,7 @@ classifiers = [
 keywords = ["finance", "yahoo", "options", "candles", "duckdb", "polars"]
 [project.scripts]
 yahoors = "yahoors.cli:main"
+yahoors-api = "yahoors.server:run"
 [project.urls]
 Homepage = "https://github.com/William-Kruta/YahooRS"
 "Bug Tracker" = "https://github.com/William-Kruta/YahooRS/issues"
