@@ -56,6 +56,7 @@ def _init_tables(db_path: str = None) -> duckdb.DuckDBPyConnection:
             option_type        VARCHAR     NOT NULL,
             ticker             VARCHAR     NOT NULL,
             dte                INTEGER     NOT NULL,
+            dtr                INTEGER,
             collected_at       TIMESTAMPTZ NOT NULL,
             delta              DOUBLE      NOT NULL,
             gamma              DOUBLE      NOT NULL,
@@ -82,12 +83,15 @@ def _init_tables(db_path: str = None) -> duckdb.DuckDBPyConnection:
             name              VARCHAR NOT NULL,
             sector            VARCHAR,
             industry          VARCHAR,
+            ceo               VARCHAR,
             country           VARCHAR,
             website           VARCHAR,
             business_summary  TEXT,
+            full_time_employees BIGINT,
             first_trading_day TIMESTAMP,
             asset_type        VARCHAR,
             trading_status    BOOLEAN,
+            dynamic_updated_at TIMESTAMPTZ,
             updated_at        TIMESTAMPTZ NOT NULL
         );
 
@@ -128,6 +132,18 @@ def _init_tables(db_path: str = None) -> duckdb.DuckDBPyConnection:
 
 
     """
+    )
+    conn.execute(
+        "ALTER TABLE company_info ADD COLUMN IF NOT EXISTS ceo VARCHAR"
+    )
+    conn.execute(
+        "ALTER TABLE company_info ADD COLUMN IF NOT EXISTS full_time_employees BIGINT"
+    )
+    conn.execute(
+        "ALTER TABLE company_info ADD COLUMN IF NOT EXISTS dynamic_updated_at TIMESTAMPTZ"
+    )
+    conn.execute(
+        "ALTER TABLE options ADD COLUMN IF NOT EXISTS dtr INTEGER"
     )
     return conn
 

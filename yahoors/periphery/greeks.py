@@ -42,7 +42,7 @@ def calculate_greeks(
     last_price = premium paid for the option
     is_call    = True for call, False for put
     """
-    if t <= 0.0 or sigma <= 0.0:
+    if t <= 0.0 or sigma <= 0.0 or s <= 0.0 or k <= 0.0:
         return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0, "bs_price": 0.0, "prob_profit": 0.0}
 
     d1, d2 = d1_d2(s, k, t, r, sigma)
@@ -56,15 +56,21 @@ def calculate_greeks(
         theta = (-(s * pdf(d1) * sigma) / (2.0 * math.sqrt(t)) - r * k * discount * cdf(d2)) / 365.0
         bs_price = s * cdf(d1) - k * discount * cdf(d2)
         breakeven = k + last_price
-        d_breakeven = (math.log(s / breakeven) + (r - 0.5 * sigma * sigma) * t) / (sigma * math.sqrt(t))
-        prob_profit = cdf(d_breakeven)
+        if breakeven <= 0.0:
+            prob_profit = 0.0
+        else:
+            d_breakeven = (math.log(s / breakeven) + (r - 0.5 * sigma * sigma) * t) / (sigma * math.sqrt(t))
+            prob_profit = cdf(d_breakeven)
     else:
         delta = cdf(d1) - 1.0
         theta = (-(s * pdf(d1) * sigma) / (2.0 * math.sqrt(t)) + r * k * discount * cdf(-d2)) / 365.0
         bs_price = k * discount * cdf(-d2) - s * cdf(-d1)
         breakeven = k - last_price
-        d_breakeven = (math.log(s / breakeven) + (r - 0.5 * sigma * sigma) * t) / (sigma * math.sqrt(t))
-        prob_profit = cdf(-d_breakeven)
+        if breakeven <= 0.0:
+            prob_profit = 0.0
+        else:
+            d_breakeven = (math.log(s / breakeven) + (r - 0.5 * sigma * sigma) * t) / (sigma * math.sqrt(t))
+            prob_profit = cdf(-d_breakeven)
 
     return {
         "delta": delta,

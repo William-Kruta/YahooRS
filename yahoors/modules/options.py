@@ -4,6 +4,7 @@ import pandas as pd
 import datetime as dt
 
 from .candles import Candles
+from .earnings import Earnings
 from ..periphery.db import _init_tables, insert_data
 from ..periphery.utils import clean_tickers, is_stale, list_difference
 from ..periphery.greeks import add_greeks_to_df
@@ -14,6 +15,7 @@ class Options:
         self.conn = _init_tables(db_path)
         self.table_name = "options"
         self.candles = Candles(db_path)
+        self.earnings = Earnings(db_path)
 
     def get_options(
         self,
@@ -22,9 +24,13 @@ class Options:
         expirations: list[str] = [],
         stale_threshold: dt.timedelta = dt.timedelta(days=1),
         force_update: bool = False,
+        min_date: dt.datetime | dt.date | str | None = None,
     ) -> pl.DataFrame:
+        if isinstance(tickers, str):
+            tickers = [tickers]
         tickers = clean_tickers(tickers)
-        df = self._read_options(tickers, get_latest=get_latest)
+        min_date_dt = self._normalize_min_date(min_date)
+        df = self._read_options(tickers, get_latest=get_latest, min_date=min_date_dt)
 
         if df.is_empty() or force_update:
             fresh = self._download_options(
@@ -63,7 +69,7 @@ class Options:
                 )
                 self._insert_options(fresh)
 
-        return self._read_options(tickers, get_latest=get_latest)
+        return self._read_options(tickers, get_latest=get_latest, min_date=min_date_dt)
 
     def _download_options(
         self, tickers: list[str], expirations: list[str] = [], get_latest: bool = True
@@ -100,6 +106,8 @@ class Options:
                         continue
             except Exception:
                 break
+        if not data:
+            return pl.DataFrame()
         df = pl.from_pandas(pd.concat(data))
         df = df.with_columns(
             pl.lit(dt.datetime.now(dt.timezone.utc)).alias("collected_at")
@@ -114,9 +122,9 @@ class Options:
             .dt.total_days()
             .alias("dte")
         )
-
         df = add_greeks_to_df(df, risk_free_rate=risk_free_rate)
         df = self.calculate_historical_probs(df, self.candles.get_candles(tickers))
+        df = self._add_days_to_report(df, tickers)
         df = df.rename(
             {
                 "contractSymbol": "contract_symbol",
@@ -150,6 +158,7 @@ class Options:
                 "option_type",
                 "ticker",
                 "dte",
+                "dtr",
                 "collected_at",
                 "delta",
                 "gamma",
@@ -256,24 +265,59 @@ class Options:
         return options_df.with_columns(pl.Series("hist_prob_profit", hist_probs))
 
     def _read_options(
-        self, tickers: list[str], get_latest: bool = False
+        self,
+        tickers: list[str],
+        get_latest: bool = False,
+        min_date: dt.datetime | None = None,
     ) -> pl.DataFrame:
+        if min_date is None:
+            where_clause = "WHERE ticker = ANY($1)"
+            params = [tickers]
+        else:
+            where_clause = "WHERE ticker = ANY($1) AND collected_at > $2"
+            params = [tickers, min_date]
+
         if get_latest:
             return self.conn.execute(
-                """
+                f"""
                 SELECT * FROM options
-                WHERE ticker = ANY($1)
+                {where_clause}
                 QUALIFY ROW_NUMBER() OVER (
                     PARTITION BY contract_symbol
                     ORDER BY collected_at DESC
                 ) = 1
             """,
-                [tickers],
+                params,
             ).pl()
         else:
             return self.conn.execute(
-                "SELECT * FROM options WHERE ticker = ANY($1)", [tickers]
+                f"SELECT * FROM options {where_clause}", params
             ).pl()
+
+    @staticmethod
+    def _normalize_min_date(
+        min_date: dt.datetime | dt.date | str | None,
+    ) -> dt.datetime | None:
+        if min_date is None:
+            return None
+        if isinstance(min_date, dt.datetime):
+            return (
+                min_date.replace(tzinfo=dt.timezone.utc)
+                if min_date.tzinfo is None
+                else min_date.astimezone(dt.timezone.utc)
+            )
+        if isinstance(min_date, dt.date):
+            return dt.datetime.combine(min_date, dt.time.min, tzinfo=dt.timezone.utc)
+        if isinstance(min_date, str):
+            parsed = dt.datetime.fromisoformat(min_date.strip().replace("Z", "+00:00"))
+            return (
+                parsed.replace(tzinfo=dt.timezone.utc)
+                if parsed.tzinfo is None
+                else parsed.astimezone(dt.timezone.utc)
+            )
+        raise TypeError(
+            "min_date must be None, datetime, date, or ISO-8601 datetime string."
+        )
 
     def _insert_options(self, df: pl.DataFrame):
         if df.is_empty():
@@ -295,6 +339,7 @@ class Options:
             "option_type",
             "ticker",
             "dte",
+            "dtr",
             "collected_at",
             "delta",
             "gamma",
@@ -311,6 +356,34 @@ class Options:
             conn=self.conn,
             pk_cols=["contract_symbol", "collected_at"],
         )
+
+    def _add_days_to_report(
+        self, options_df: pl.DataFrame, tickers: list[str]
+    ) -> pl.DataFrame:
+        earnings_df = self.earnings.get_earnings_dates(tickers)
+        if earnings_df.is_empty():
+            return options_df.with_columns(pl.lit(None).cast(pl.Int64).alias("dtr"))
+
+        today = dt.datetime.now(dt.timezone.utc).date()
+        latest_earnings = earnings_df.group_by("ticker").agg(
+            pl.col("earnings_date").max().alias("earnings_date")
+        )
+        latest_earnings = latest_earnings.with_columns(
+            pl.col("earnings_date")
+            .map_elements(
+                lambda value: (
+                    (
+                        (value.date() if isinstance(value, dt.datetime) else value)
+                        - today
+                    ).days
+                    if value is not None
+                    else None
+                ),
+                return_dtype=pl.Int64,
+            )
+            .alias("dtr")
+        ).select(["ticker", "dtr"])
+        return options_df.join(latest_earnings, on="ticker", how="left")
 
 
 def parse_expiration(contract: str) -> str:

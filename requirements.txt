@@ -3,3 +3,8 @@ yfinance
 polars
 pyarrow
 lxml
+
+# Server
+httpx
+fastapi
+uvicorn

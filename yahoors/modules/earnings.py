@@ -107,13 +107,19 @@ class Earnings:
 
     # ── Public getters ──────────────────────────────────────────
 
-    def get_earnings_dates(self, tickers: list[str]) -> pl.DataFrame:
+    def get_earnings_dates(
+        self, tickers: list[str], force_update: bool = False
+    ) -> pl.DataFrame:
         return self._get(tickers, schema_key="dates")
 
-    def get_earnings_estimates(self, tickers: list[str]) -> pl.DataFrame:
+    def get_earnings_estimates(
+        self, tickers: list[str], force_update: bool = False
+    ) -> pl.DataFrame:
         return self._get(tickers, schema_key="estimates")
 
-    def get_earnings_history(self, tickers: list[str]) -> pl.DataFrame:
+    def get_earnings_history(
+        self, tickers: list[str], force_update: bool = False
+    ) -> pl.DataFrame:
         return self._get(tickers, schema_key="history")
 
     # ── Core get logic ──────────────────────────────────────────
@@ -122,7 +128,8 @@ class Earnings:
         self,
         tickers: list[str],
         schema_key: str,
-        stale_threshold: dt.timedelta = dt.timedelta(hours=36),
+        stale_threshold: dt.timedelta = dt.timedelta(days=90),
+        force_update: bool = False,
     ) -> pl.DataFrame:
         if isinstance(tickers, str):
             tickers = [tickers]
@@ -130,7 +137,7 @@ class Earnings:
 
         df = self._read(tickers, schema_key)
 
-        if df.is_empty():
+        if df.is_empty() or force_update:
             data = self._download_earnings(tickers)
             self._insert(data.get(schema_key, pl.DataFrame()), schema_key)
             return self._read(tickers, schema_key)

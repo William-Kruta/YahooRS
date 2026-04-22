@@ -10,6 +10,8 @@ def options_screener(
     long: bool = False,
     min_collateral: float = 0.0,
     max_collateral: float = float("inf"),
+    min_premium: float = 0.10,
+    min_roc: float = 0.005,
 ) -> pl.DataFrame:
     side = "long" if long else "short"
 
@@ -73,8 +75,8 @@ def options_screener(
             ).alias("expected_return")
         )
         # Minimum premium and ROC filters
-        .filter(pl.col("premium") > 0.10)
-        .filter(pl.col("roc") > 0.005)
+        .filter(pl.col("premium") > min_premium)
+        .filter(pl.col("roc") > min_roc)
         .sort("expected_return", descending=True)
         .collect()
     )

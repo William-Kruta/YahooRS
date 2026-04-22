@@ -20,6 +20,8 @@ class Candles:
         tickers: list[str],
         interval: str = "1d",
         period: str = "max",
+        start: str = None,
+        end: str = None,
         stale_threshold: dt.timedelta = None,
     ) -> pl.DataFrame:
         if stale_threshold is None:
@@ -27,15 +29,16 @@ class Candles:
         if isinstance(tickers, str):
             tickers = [tickers]
         tickers = clean_tickers(tickers)
-        df = self._read_candles(tickers, interval)
+        df = self._read_candles(tickers, interval, start=start, end=end)
 
         if df.is_empty():
-            fresh = self._download_candles(tickers, interval, period)
+            fresh = self._download_candles(tickers, interval, period, start=start, end=end)
             self._insert_candles(fresh)
-            return self._read_candles(tickers, interval)
+            return self._read_candles(tickers, interval, start=start, end=end)
 
         # Lightweight staleness check via SQL
         latest_dates = self._get_latest_dates(tickers, interval)
+        earliest_dates = self._get_earliest_dates(tickers, interval)
         db_tickers = list(latest_dates.keys())
         missing_tickers = list_difference(db_tickers, tickers)
 
@@ -52,13 +55,25 @@ class Candles:
                 )
                 self._insert_candles(fresh)
 
+            # Backfill missing history when a start date is requested
+            if start and ticker in earliest_dates:
+                earliest = self._parse_date(earliest_dates[ticker])
+                requested_start = self._parse_date(start)
+                if requested_start < earliest:
+                    needs_refresh = True
+                    end_date = earliest.strftime("%Y-%m-%d")
+                    fresh = self._download_candles(
+                        [ticker], interval, start=start, end=end_date
+                    )
+                    self._insert_candles(fresh)
+
         if missing_tickers:
             needs_refresh = True
-            fresh = self._download_candles(missing_tickers, interval, period)
+            fresh = self._download_candles(missing_tickers, interval, period, start=start, end=end)
             self._insert_candles(fresh)
 
         return (
-            self._read_candles(tickers, interval).sort(by="date")
+            self._read_candles(tickers, interval, start=start, end=end).sort(by="date")
             if needs_refresh
             else df
         )
@@ -160,15 +175,30 @@ class Candles:
         cols_to_select = [c for c in target_cols if c in df.columns]
         return df.select(cols_to_select)
 
-    def _read_candles(self, tickers: list[str], interval: str) -> pl.DataFrame:
-        return self.conn.execute(
-            "SELECT * FROM candles WHERE ticker = ANY($1) AND interval = $2 ORDER BY date, ticker",
-            [tickers, interval],
-        ).pl()
+    def _read_candles(
+        self, tickers: list[str], interval: str, start: str = None, end: str = None
+    ) -> pl.DataFrame:
+        query = "SELECT * FROM candles WHERE ticker = ANY($1) AND interval = $2"
+        params = [tickers, interval]
+        if start:
+            query += f" AND date >= ${len(params) + 1}"
+            params.append(start)
+        if end:
+            query += f" AND date <= ${len(params) + 1}"
+            params.append(end)
+        query += " ORDER BY date, ticker"
+        return self.conn.execute(query, params).pl()
 
     def _get_latest_dates(self, tickers: list[str], interval: str) -> dict[str, str]:
         df = self.conn.execute(
             "SELECT ticker, MAX(date) as latest_date FROM candles WHERE ticker = ANY($1) AND interval = $2 GROUP BY ticker",
+            [tickers, interval],
+        ).pl()
+        return {row[0]: row[1] for row in df.iter_rows()}
+
+    def _get_earliest_dates(self, tickers: list[str], interval: str) -> dict[str, str]:
+        df = self.conn.execute(
+            "SELECT ticker, MIN(date) as earliest_date FROM candles WHERE ticker = ANY($1) AND interval = $2 GROUP BY ticker",
             [tickers, interval],
         ).pl()
         return {row[0]: row[1] for row in df.iter_rows()}
