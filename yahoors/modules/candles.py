@@ -14,6 +14,7 @@ class Candles:
         self.conn = _init_tables(db_path)
         self.table_name = "candles"
         self.debug = debug
+        self._failed_tickers: set[str] = set()
 
     def get_candles(
         self,
@@ -32,7 +33,9 @@ class Candles:
         df = self._read_candles(tickers, interval, start=start, end=end)
 
         if df.is_empty():
-            fresh = self._download_candles(tickers, interval, period, start=start, end=end)
+            fresh = self._download_candles(
+                tickers, interval, period, start=start, end=end
+            )
             self._insert_candles(fresh)
             return self._read_candles(tickers, interval, start=start, end=end)
 
@@ -45,32 +48,45 @@ class Candles:
         needs_refresh = False
         now = dt.datetime.now()
 
+        # Collect stale and backfill work before downloading so we can batch
+        stale_groups: dict[str, list[str]] = {}   # start_date -> tickers
+        backfill_groups: dict[str, list[str]] = {} # end_date   -> tickers
+
         for ticker, date_str in latest_dates.items():
             latest = self._parse_date(date_str)
             if (now - latest) > stale_threshold:
-                needs_refresh = True
                 start_date = latest.strftime("%Y-%m-%d")
-                fresh = self._download_candles(
-                    [ticker], interval, start=start_date, end=now
-                )
-                self._insert_candles(fresh)
+                stale_groups.setdefault(start_date, []).append(ticker)
 
-            # Backfill missing history when a start date is requested
             if start and ticker in earliest_dates:
                 earliest = self._parse_date(earliest_dates[ticker])
                 requested_start = self._parse_date(start)
                 if requested_start < earliest:
-                    needs_refresh = True
                     end_date = earliest.strftime("%Y-%m-%d")
-                    fresh = self._download_candles(
-                        [ticker], interval, start=start, end=end_date
-                    )
-                    self._insert_candles(fresh)
+                    backfill_groups.setdefault(end_date, []).append(ticker)
+
+        # Batch download stale tickers grouped by proximity of start date
+        if stale_groups:
+            needs_refresh = True
+            for start_date, batch in self._merge_date_groups(stale_groups).items():
+                fresh = self._download_candles(batch, interval, start=start_date, end=now)
+                self._insert_candles(fresh)
+
+        # Batch download backfills grouped by their end date
+        if backfill_groups:
+            needs_refresh = True
+            for end_date, batch in backfill_groups.items():
+                fresh = self._download_candles(batch, interval, start=start, end=end_date)
+                self._insert_candles(fresh)
 
         if missing_tickers:
-            needs_refresh = True
-            fresh = self._download_candles(missing_tickers, interval, period, start=start, end=end)
-            self._insert_candles(fresh)
+            to_fetch = [t for t in missing_tickers if t not in self._failed_tickers]
+            if to_fetch:
+                needs_refresh = True
+                fresh = self._download_candles(to_fetch, interval, period, start=start, end=end)
+                self._insert_candles(fresh)
+                returned = set(fresh["ticker"].unique().to_list()) if not fresh.is_empty() else set()
+                self._failed_tickers.update(set(to_fetch) - returned)
 
         return (
             self._read_candles(tickers, interval, start=start, end=end).sort(by="date")
@@ -125,28 +141,10 @@ class Candles:
         else:
             params = {"period": period}
 
-        # Download with error handling
+        print(f"Ticker: {tickers}   Params: {params}")
         data = yf.download(tickers, interval=interval, **params)
         if data.empty:
-            # If batch failed, try individual downloads to salvage what we can
-            if len(tickers) > 1:
-                frames = []
-                for ticker in tickers:
-                    try:
-                        single = yf.download(ticker, interval=interval, **params)
-                        if not single.empty:
-                            single = single.reset_index()
-                            if "Ticker" not in single.columns:
-                                single["Ticker"] = ticker
-                            frames.append(single)
-                    except Exception:
-                        pass
-                if not frames:
-                    return pl.DataFrame()
-                data = pd.concat(frames)
-                data["Interval"] = interval
-            else:
-                return pl.DataFrame()
+            return pl.DataFrame()
         else:
             if isinstance(data.columns, pd.MultiIndex):
                 data = data.stack(level=1, future_stack=True).reset_index()
@@ -241,6 +239,33 @@ class Candles:
             conn=self.conn,
             pk_cols=["date", "ticker", "interval"],
         )
+
+    @staticmethod
+    def _merge_date_groups(
+        groups: dict[str, list[str]], tolerance_days: int = 5
+    ) -> dict[str, list[str]]:
+        """
+        Merge groups whose start dates fall within tolerance_days of each other
+        into a single batch, using the earliest date so all tickers are covered.
+        Extra rows downloaded for already-cached tickers are deduped on insert.
+        """
+        sorted_dates = sorted(groups.keys())
+        merged: dict[str, list[str]] = {}
+        cur_str = sorted_dates[0]
+        cur_dt = dt.datetime.strptime(cur_str, "%Y-%m-%d")
+        cur_tickers = list(groups[cur_str])
+
+        for date_str in sorted_dates[1:]:
+            d = dt.datetime.strptime(date_str, "%Y-%m-%d")
+            if (d - cur_dt).days <= tolerance_days:
+                cur_tickers.extend(groups[date_str])
+            else:
+                merged[cur_str] = cur_tickers
+                cur_str, cur_dt = date_str, d
+                cur_tickers = list(groups[date_str])
+
+        merged[cur_str] = cur_tickers
+        return merged
 
     @staticmethod
     def _parse_date(date_val) -> dt.datetime:

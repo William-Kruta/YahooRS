@@ -158,6 +158,9 @@ def insert_data(
     col_names = ", ".join(final_cols)
 
     if pk_cols:
+        pk_cols_in_df = [c for c in pk_cols if c in df.columns]
+        if pk_cols_in_df:
+            df = df.unique(subset=pk_cols_in_df, keep="first")
         pk_where = " AND ".join([f"existing.{c} = df.{c}" for c in pk_cols])
         conn.execute(
             f"""

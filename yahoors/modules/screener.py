@@ -12,6 +12,7 @@ def options_screener(
     max_collateral: float = float("inf"),
     min_premium: float = 0.10,
     min_roc: float = 0.005,
+    max_trade_age: dt.timedelta | None = dt.timedelta(hours=2),
 ) -> pl.DataFrame:
     side = "long" if long else "short"
 
@@ -80,7 +81,8 @@ def options_screener(
         .sort("expected_return", descending=True)
         .collect()
     )
-    df = filter_stale_trades(df, max_age=dt.timedelta(hours=2))
+    if max_trade_age is not None:
+        df = filter_stale_trades(df, max_age=max_trade_age)
     return df
 
 

@@ -363,7 +363,14 @@ def _fetch_one(ticker: str) -> dict[str, pd.DataFrame]:
     obj = yf.Ticker(ticker)
     result = {}
     for key, schema in SCHEMAS.items():
-        df = getattr(obj, schema.yf_attr)
-        df["ticker"] = ticker
-        result[key] = df
+        try:
+            df = getattr(obj, schema.yf_attr)
+            if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+                result[key] = pd.DataFrame()
+            else:
+                df = df.copy()
+                df["ticker"] = ticker
+                result[key] = df
+        except Exception:
+            result[key] = pd.DataFrame()
     return result

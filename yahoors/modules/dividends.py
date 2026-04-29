@@ -107,7 +107,7 @@ class Dividends:
 
     def update_dividend_info(self, tickers: list[str], dividend_df: pl.DataFrame):
         frequency = parse_dividend_frequency(dividend_df)
-        query = f"INSERT OR IGNORE INTO dividend_info (ticker, frequency, status, updated_at) VALUES (?, ?, ?, ?)"
+        query = "INSERT INTO dividend_info (ticker, frequency, status, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING"
         for t in tickers:
             try:
                 freq = frequency[t]

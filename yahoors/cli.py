@@ -4,6 +4,7 @@ import json
 import sys
 
 from .modules.candles import Candles
+from .modules.earnings import Earnings
 from .modules.options import Options
 from .modules.screener import options_screener
 from .modules.statements import Statements
@@ -19,8 +20,16 @@ def get_risk_free_rate(candles: Candles) -> float:
 
 
 def cmd_earnings(args):
-    # TODO: implement earnings
-    print(f"Earnings for {args.ticker} not yet implemented")
+    db_path = str(get_db_path())
+    earnings = Earnings(db_path)
+    tickers = clean_tickers([args.ticker])
+    type_map = {
+        "dates": earnings.get_earnings_dates,
+        "estimates": earnings.get_earnings_estimates,
+        "history": earnings.get_earnings_history,
+    }
+    df = type_map[args.type](tickers)
+    print(df)
 
 
 def cmd_get_candles(args):
@@ -103,19 +112,17 @@ def cmd_statements(args):
     pivoted = statements.pivot_statement(df, period)
 
     if args.ratios:
-        all_types = ["income_statement", "balance_sheet", "cash_flow"]
-        remaining = [t for t in all_types if t != statement_type]
-
-        for r in remaining:
-            extra = statements.get_statement(tickers, r, period)
-            extra_pivoted = statements.pivot_statement(extra, period)
-            pivoted = pivoted.vstack(extra_pivoted)
-
+        income_pivoted = statements.pivot_statement(
+            statements.get_statement(tickers, "income_statement", period), period
+        )
+        balance_pivoted = statements.pivot_statement(
+            statements.get_statement(tickers, "balance_sheet", period), period
+        )
         candles_df = candles.get_candles(tickers)
         ratios = statements.get_ratios(
             tickers,
-            income_df=pivoted.filter(lambda: statement_type == "income_statement"),
-            balance_sheet_df=pivoted,
+            income_df=income_pivoted,
+            balance_sheet_df=balance_pivoted,
             candles_df=candles_df,
             period=period,
         )
@@ -143,6 +150,7 @@ def main():
     # earnings
     p_earnings = subparsers.add_parser("earnings")
     p_earnings.add_argument("-t", "--ticker", required=True)
+    p_earnings.add_argument("--type", choices=["dates", "estimates", "history"], default="dates")
     p_earnings.set_defaults(func=cmd_earnings)
 
     # get-candles
