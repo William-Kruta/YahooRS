@@ -102,7 +102,8 @@ def quality_filter(
             ).pl()["ticker"].to_list()
         )
         return [t for t in tickers if t in passing or t in no_data]
-    except Exception:
+    except Exception as e:
+        print(f"[quality_filter] warning: DB query failed ({e}), returning unfiltered list")
         return tickers
 
 

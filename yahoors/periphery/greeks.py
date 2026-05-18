@@ -43,7 +43,7 @@ def calculate_greeks(
     is_call    = True for call, False for put
     """
     if t <= 0.0 or sigma <= 0.0 or s <= 0.0 or k <= 0.0:
-        return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0, "bs_price": 0.0, "prob_profit": 0.0}
+        return {"delta": None, "gamma": None, "theta": None, "vega": None, "bs_price": None, "prob_profit": None}
 
     d1, d2 = d1_d2(s, k, t, r, sigma)
     discount = math.exp(-r * t)
@@ -166,8 +166,6 @@ def add_greeks_to_df(
 
         if ask > 0.0 and bid > 0.0:
             premium = (bid + ask) / 2.0
-        elif ask > 0.0:
-            premium = ask
         elif bid > 0.0:
             premium = bid
         else:

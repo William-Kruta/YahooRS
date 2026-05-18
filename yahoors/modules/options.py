@@ -2,6 +2,7 @@ import yfinance as yf
 import polars as pl
 import pandas as pd
 import datetime as dt
+from typing import Literal
 
 from .candles import Candles
 from .earnings import Earnings
@@ -10,12 +11,168 @@ from ..periphery.utils import clean_tickers, is_stale, list_difference
 from ..periphery.greeks import add_greeks_to_df
 
 
+RENAME = {
+    "contractSymbol": "contract_symbol",
+    "lastTradeDate": "last_trade_date",
+    "strike": "strike",
+    "lastPrice": "last_price",
+    "bid": "bid",
+    "ask": "ask",
+    "volume": "volume",
+    "openInterest": "open_interest",
+    "impliedVolatility": "implied_volatility",
+    "inTheMoney": "in_the_money",
+    "ticker": "ticker",
+    "dte": "dte",
+    "stock_price": "stock_price",
+}
+
+SELECTION = [
+    "contract_symbol",
+    "last_trade_date",
+    "strike",
+    "stock_price",
+    "last_price",
+    "bid",
+    "ask",
+    "volume",
+    "open_interest",
+    "implied_volatility",
+    "in_the_money",
+    "expiration",
+    "option_type",
+    "ticker",
+    "dte",
+    "dtr",
+    "collected_at",
+    "delta",
+    "gamma",
+    "theta",
+    "vega",
+    "bs_price",
+    "prob_profit",
+    "hist_prob_profit",
+]
+
+
 class Options:
     def __init__(self, db_path: str = None):
         self.conn = _init_tables(db_path)
         self.table_name = "options"
         self.candles = Candles(db_path)
         self.earnings = Earnings(db_path)
+
+    def _calc_date_deltas(
+        self,
+        dates: list[str],
+        min_dte: int,
+        max_dte: int,
+        ref_date: str = None,
+        date_format: str = "%Y-%m-%d",
+    ) -> dict[str, int]:
+
+        cur_date = (
+            dt.datetime.strptime(ref_date, date_format).date()
+            if ref_date is not None
+            else dt.date.today()
+        )
+        deltas = {
+            d: delta
+            for d in dates
+            if min_dte
+            <= (delta := (dt.datetime.strptime(d, date_format).date() - cur_date).days)
+            <= max_dte
+        }
+        return deltas
+
+    def get_options_by_dte_range(
+        self,
+        tickers: list,
+        min_dte: int = 0,
+        max_dte: int = 10,
+        min_bid: int = 0,
+        min_ask: int = 0,
+        option_type: Literal["call", "put", "*"] = "*",
+        side: Literal["long", "short", "*"] = "*",
+        rfr_ticker: str = "^TNX",
+    ):
+        if isinstance(tickers, str):
+            tickers = [tickers]
+        assert option_type in (
+            "call",
+            "put",
+            "*",
+        ), f"option_type must be 'call', 'put', or '*', got {option_type!r}"
+        assert side in (
+            "long",
+            "short",
+            "*",
+        ), f"side must be 'long', 'short', or '*', got {side!r}"
+        # risk_free_rate = self.candles.get_last_price(["^TNX"])["^TNX"] / 100.0
+        data = []
+        _tickers = [*tickers, rfr_ticker]
+        prices = self.candles.get_last_price(tickers=_tickers)
+        risk_free_rate = prices[rfr_ticker] / 100.0
+        for t in tickers:
+            obj = yf.Ticker(t)
+            dates = obj.options
+            dates = self._calc_date_deltas(
+                dates=dates, min_dte=min_dte, max_dte=max_dte
+            )
+            stock_price = prices[t]
+            for k, v in dates.items():
+                chain = obj.option_chain(k)
+                if option_type.lower() == "call" or option_type.lower() == "*":
+                    calls = self._iterate_chain_type(
+                        chain.calls, "call", t, stock_price
+                    )
+                    data.append(calls)
+                elif option_type.lower() == "put" or option_type.lower() == "*":
+                    puts = self._iterate_chain_type(chain.puts, "put", t, stock_price)
+                    data.append(puts)
+
+        # df = pd.concat(data)
+        df = pl.from_pandas(pd.concat(data))
+        df = df.with_columns(
+            pl.lit(dt.datetime.now(dt.timezone.utc)).alias("collected_at")
+        )
+        if min_bid >= 0:
+            df = df.filter(pl.col("bid") >= min_bid)
+        if min_ask >= 0:
+            df = df.filter(pl.col("ask") >= min_ask)
+        df = df.with_columns(
+            pl.col("contractSymbol")
+            .map_elements(parse_expiration, return_dtype=pl.Utf8)
+            .str.to_date("%Y-%m-%d")
+            .alias("expiration"),
+        ).with_columns(
+            (pl.col("expiration") - pl.lit(dt.date.today()))
+            .dt.total_days()
+            .alias("dte")
+        )
+        df = add_greeks_to_df(df, risk_free_rate=risk_free_rate)
+        df = self.calculate_historical_probs(df, self.candles.get_candles(tickers))
+        df = self._add_days_to_report(df, tickers)
+        df = df.rename(mapping=RENAME).select(SELECTION)
+        # return pl.from_pandas()
+        df = df.with_columns(
+            pl.col("volume", "open_interest").fill_null(0),
+            pl.col("bid", "ask", "last_price", "implied_volatility").fill_null(0.0),
+        )
+        if side == "short":
+            df = df.with_columns(
+                (1 - pl.col("prob_profit")).alias("prob_profit"),
+                (1 - pl.col("hist_prob_profit")).alias("hist_prob_profit"),
+            )
+        return df
+
+    def _iterate_chain_type(
+        self, chain: pd.DataFrame, option_type: str, ticker: str, stock_price: float
+    ):
+        chain["ticker"] = ticker.upper()
+        chain["option_type"] = option_type.lower()
+        chain["stock_price"] = stock_price
+        return chain
 
     def get_options(
         self,
@@ -83,7 +240,7 @@ class Options:
         for t in tickers:
             try:
                 obj = yf.Ticker(t)
-                last_price = self.candles.get_last_price([t])[t]
+                last_price = self.candles.get_candles([t])
                 if not expirations:
                     expirations = obj.options
                     if get_latest:
@@ -125,50 +282,7 @@ class Options:
         df = add_greeks_to_df(df, risk_free_rate=risk_free_rate)
         df = self.calculate_historical_probs(df, self.candles.get_candles(tickers))
         df = self._add_days_to_report(df, tickers)
-        df = df.rename(
-            {
-                "contractSymbol": "contract_symbol",
-                "lastTradeDate": "last_trade_date",
-                "strike": "strike",
-                "lastPrice": "last_price",
-                "bid": "bid",
-                "ask": "ask",
-                "volume": "volume",
-                "openInterest": "open_interest",
-                "impliedVolatility": "implied_volatility",
-                "inTheMoney": "in_the_money",
-                "ticker": "ticker",
-                "dte": "dte",
-                "stock_price": "stock_price",
-            }
-        ).select(
-            [
-                "contract_symbol",
-                "last_trade_date",
-                "strike",
-                "stock_price",
-                "last_price",
-                "bid",
-                "ask",
-                "volume",
-                "open_interest",
-                "implied_volatility",
-                "in_the_money",
-                "expiration",
-                "option_type",
-                "ticker",
-                "dte",
-                "dtr",
-                "collected_at",
-                "delta",
-                "gamma",
-                "theta",
-                "vega",
-                "bs_price",
-                "prob_profit",
-                "hist_prob_profit",
-            ]
-        )
+        df = df.rename(mapping=RENAME).select(SELECTION)
         # return pl.from_pandas()
         df = df.with_columns(
             pl.col("volume", "open_interest").fill_null(0),
@@ -206,7 +320,7 @@ class Options:
         option_types = options_df["option_type"].to_list()
         bids = options_df["bid"].to_list()
         asks = options_df["ask"].to_list()
-        last_prices = options_df["lastPrice"].to_list()
+        # last_prices = options_df["last_price"].to_list()
         stock_prices = options_df["stock_price"].to_list()
 
         hist_probs: list[float | None] = []
@@ -219,7 +333,7 @@ class Options:
             current_price = stock_prices[i] or 0.0
             bid = bids[i] or 0.0
             ask = asks[i] or 0.0
-            last = last_prices[i] or 0.0
+            # last = last_prices[i] or 0.0
 
             if ask > 0.0 and bid > 0.0:
                 premium = (bid + ask) / 2.0
@@ -228,7 +342,7 @@ class Options:
             elif bid > 0.0:
                 premium = bid
             else:
-                premium = last
+                premium = 0.0
 
             breakeven = strike + premium if opt_type == "call" else strike - premium
 

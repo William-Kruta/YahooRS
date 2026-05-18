@@ -1,4 +1,7 @@
 import datetime as dt
+from zoneinfo import ZoneInfo
+
+_ET = ZoneInfo("America/New_York")
 
 # US market holidays (fixed + observed rules)
 def _get_us_market_holidays(year: int) -> set[dt.date]:
@@ -83,11 +86,11 @@ def _good_friday(year: int) -> dt.date:
 
 def is_market_open(now: dt.datetime | None = None) -> bool:
     """Check if US equity market is currently open."""
-    now = now or dt.datetime.now(dt.timezone(dt.timedelta(hours=-4)))  # ET
+    now = now or dt.datetime.now(_ET)
     if now.tzinfo is None:
         raise ValueError("now must be timezone-aware")
 
-    et = now.astimezone(dt.timezone(dt.timedelta(hours=-4)))
+    et = now.astimezone(_ET)
     today = et.date()
 
     # Weekend
@@ -106,9 +109,8 @@ def is_market_open(now: dt.datetime | None = None) -> bool:
 
 def next_market_open(now: dt.datetime | None = None) -> dt.datetime:
     """Get the next market open timestamp."""
-    et_tz = dt.timezone(dt.timedelta(hours=-4))
-    now = now or dt.datetime.now(et_tz)
-    et = now.astimezone(et_tz)
+    now = now or dt.datetime.now(_ET)
+    et = now.astimezone(_ET)
 
     # If market is currently open or before open today, check today
     candidate = et.replace(hour=9, minute=30, second=0, microsecond=0)
@@ -122,11 +124,11 @@ def next_market_open(now: dt.datetime | None = None) -> dt.datetime:
     day = et.date() + dt.timedelta(days=1)
     for _ in range(10):  # max 10 days covers any holiday cluster
         if day.weekday() < 5 and day not in _get_us_market_holidays(day.year):
-            return dt.datetime.combine(day, dt.time(9, 30), tzinfo=et_tz)
+            return dt.datetime.combine(day, dt.time(9, 30), tzinfo=_ET)
         day += dt.timedelta(days=1)
 
     # Fallback (should never hit)
-    return dt.datetime.combine(day, dt.time(9, 30), tzinfo=et_tz)
+    return dt.datetime.combine(day, dt.time(9, 30), tzinfo=_ET)
 
 
 def get_stale_threshold(interval: str) -> dt.timedelta:

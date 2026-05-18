@@ -203,7 +203,7 @@ class Earnings:
             output[key] = schema.select_and_rename(combined)
 
         # Estimates need extra processing
-        if "estimates" in output:
+        if "estimates" in output and not output["estimates"].is_empty():
             output["estimates"] = resolve_earnings_periods(output["estimates"])
             output["estimates"] = output["estimates"].with_columns(
                 pl.lit(dt.datetime.now()).alias("collected_at")
@@ -297,17 +297,22 @@ class Earnings:
         if not reported.is_empty():
             # Delete the old null rows for these tickers, then insert the fresh ones
             for ticker in stale_tickers:
+                reported_dates = (
+                    reported.filter(pl.col("ticker") == ticker)
+                    .get_column("earnings_date")
+                    .to_list()
+                )
+                if not reported_dates:
+                    continue
+                placeholders = ", ".join(["?" for _ in reported_dates])
                 self.conn.execute(
-                    """
+                    f"""
                     DELETE FROM earnings_dates
-                    WHERE ticker = $1
+                    WHERE ticker = ?
                     AND reported_eps IS NULL
-                    AND earnings_date IN (
-                        SELECT earnings_date FROM df
-                        WHERE ticker = $1 AND reported_eps IS NOT NULL
-                    )
+                    AND earnings_date IN ({placeholders})
                     """,
-                    [ticker],
+                    [ticker] + reported_dates,
                 )
             # Re-insert the full fresh dataset (dedup handles already-existing rows)
             self._insert(dates_df, "dates")
@@ -349,7 +354,14 @@ def resolve_earnings_periods(
         period_label = "Q" if unit == "q" else "A"
         return resolved, label, period_label
 
-    periods = df["period"].to_list()
+    try:
+        periods = df["period"].to_list()
+    except pl.exceptions.ColumnNotFoundError:
+        periods = []
+
+    if not periods:
+        return df
+
     resolved, labels, period_labels = zip(*[_resolve(p) for p in periods])
 
     return df.with_columns(

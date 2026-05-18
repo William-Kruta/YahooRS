@@ -134,6 +134,13 @@ def _init_tables(db_path: str = None) -> duckdb.DuckDBPyConnection:
     """
     )
     conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_candles_ticker_interval ON candles (ticker, interval);
+        CREATE INDEX IF NOT EXISTS idx_options_ticker_collected ON options (ticker, collected_at);
+        CREATE INDEX IF NOT EXISTS idx_statements_ticker_type ON statements (ticker, statement_type, period);
+        """
+    )
+    conn.execute(
         "ALTER TABLE company_info ADD COLUMN IF NOT EXISTS ceo VARCHAR"
     )
     conn.execute(
@@ -144,6 +151,9 @@ def _init_tables(db_path: str = None) -> duckdb.DuckDBPyConnection:
     )
     conn.execute(
         "ALTER TABLE options ADD COLUMN IF NOT EXISTS dtr INTEGER"
+    )
+    conn.execute(
+        "ALTER TABLE candles ADD COLUMN IF NOT EXISTS collected_at TIMESTAMPTZ"
     )
     return conn
 

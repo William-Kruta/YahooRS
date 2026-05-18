@@ -369,6 +369,7 @@ class Statements:
                 current_liabilities = get_val(bs, CURRENT_LIABILITIES, date_col)
                 book_value = get_val(bs, TANGIBLE_BOOK_VALUE, date_col)
                 cash_and_cash_equivalents = get_val(bs, CASH_AND_CASH_EQUIVALENTS, date_col)
+                total_assets = get_val(bs, TOTAL_ASSETS, date_col)
                 inventory = (
                     avg_values.get((ticker, "inventory"), {}).get(date_col)
                     if period == "Q"
@@ -522,16 +523,16 @@ class Statements:
                         }
                     )
 
-                # Asset Turnover (annualize revenue, inventory is point-in-time)
-                if ann_revenue and inventory:
+                # Asset Turnover = Revenue / Total Assets
+                if ann_revenue and total_assets:
                     results.append(
                         {
                             "ticker": ticker,
                             "date": date_col,
                             "ratio_name": "Asset Turnover",
-                            "value": ann_revenue / inventory,
+                            "value": ann_revenue / total_assets,
                         }
-                    ) 
+                    )
 
                 # Inventory Turnover (annualize revenue, inventory is point-in-time)
                 if ann_cogs and inventory:

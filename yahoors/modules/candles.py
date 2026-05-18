@@ -1,4 +1,3 @@
-import duckdb
 import pandas as pd
 import polars as pl
 import yfinance as yf
@@ -25,56 +24,56 @@ class Candles:
         end: str = None,
         stale_threshold: dt.timedelta = None,
     ) -> pl.DataFrame:
-        if stale_threshold is None:
-            stale_threshold = get_stale_threshold(interval)
         if isinstance(tickers, str):
             tickers = [tickers]
         tickers = clean_tickers(tickers)
-        df = self._read_candles(tickers, interval, start=start, end=end)
+        if stale_threshold is None:
+            stale_threshold = get_stale_threshold(interval)
+        self._ensure_fresh(tickers, interval, period, start, end, stale_threshold)
+        return self._read_candles(tickers, interval, start=start, end=end).sort(by="date")
 
-        if df.is_empty():
-            fresh = self._download_candles(
-                tickers, interval, period, start=start, end=end
-            )
+    def _ensure_fresh(
+        self,
+        tickers: list[str],
+        interval: str = "1d",
+        period: str = "max",
+        start: str = None,
+        end: str = None,
+        stale_threshold: dt.timedelta = None,
+    ) -> None:
+        if stale_threshold is None:
+            stale_threshold = get_stale_threshold(interval)
+
+        if not self._has_candles(tickers, interval):
+            fresh = self._download_candles(tickers, interval, period, start=start, end=end)
             self._insert_candles(fresh)
-            return self._read_candles(tickers, interval, start=start, end=end)
+            return
 
-        # Lightweight staleness check via SQL
-        latest_dates = self._get_latest_dates(tickers, interval)
-        earliest_dates = self._get_earliest_dates(tickers, interval)
-        db_tickers = list(latest_dates.keys())
+        ticker_stats = self._get_ticker_stats(tickers, interval)
+        db_tickers = list(ticker_stats.keys())
         missing_tickers = list_difference(db_tickers, tickers)
 
-        needs_refresh = False
-        now = dt.datetime.now()
+        now = dt.datetime.now(dt.timezone.utc)
+        requested_start = self._parse_date(start) if start else None
 
-        # Collect stale and backfill work before downloading so we can batch
-        stale_groups: dict[str, list[str]] = {}   # start_date -> tickers
-        backfill_groups: dict[str, list[str]] = {} # end_date   -> tickers
+        stale_groups: dict[str, list[str]] = {}
+        backfill_groups: dict[str, list[str]] = {}
 
-        for ticker, date_str in latest_dates.items():
-            latest = self._parse_date(date_str)
-            if (now - latest) > stale_threshold:
-                start_date = latest.strftime("%Y-%m-%d")
+        for ticker, (latest_candle, latest_collected, earliest_candle) in ticker_stats.items():
+            if (now - self._parse_date(latest_collected)) > stale_threshold:
+                start_date = self._parse_date(latest_candle).strftime("%Y-%m-%d")
                 stale_groups.setdefault(start_date, []).append(ticker)
 
-            if start and ticker in earliest_dates:
-                earliest = self._parse_date(earliest_dates[ticker])
-                requested_start = self._parse_date(start)
-                if requested_start < earliest:
-                    end_date = earliest.strftime("%Y-%m-%d")
-                    backfill_groups.setdefault(end_date, []).append(ticker)
+            if requested_start is not None and self._parse_date(earliest_candle) > requested_start:
+                end_date = self._parse_date(earliest_candle).strftime("%Y-%m-%d")
+                backfill_groups.setdefault(end_date, []).append(ticker)
 
-        # Batch download stale tickers grouped by proximity of start date
         if stale_groups:
-            needs_refresh = True
             for start_date, batch in self._merge_date_groups(stale_groups).items():
                 fresh = self._download_candles(batch, interval, start=start_date, end=now)
                 self._insert_candles(fresh)
 
-        # Batch download backfills grouped by their end date
         if backfill_groups:
-            needs_refresh = True
             for end_date, batch in backfill_groups.items():
                 fresh = self._download_candles(batch, interval, start=start, end=end_date)
                 self._insert_candles(fresh)
@@ -82,17 +81,10 @@ class Candles:
         if missing_tickers:
             to_fetch = [t for t in missing_tickers if t not in self._failed_tickers]
             if to_fetch:
-                needs_refresh = True
                 fresh = self._download_candles(to_fetch, interval, period, start=start, end=end)
                 self._insert_candles(fresh)
                 returned = set(fresh["ticker"].unique().to_list()) if not fresh.is_empty() else set()
                 self._failed_tickers.update(set(to_fetch) - returned)
-
-        return (
-            self._read_candles(tickers, interval, start=start, end=end).sort(by="date")
-            if needs_refresh
-            else df
-        )
 
     def get_last_price(
         self, tickers: list[str], select_col: str = "close", alias: str = "value"
@@ -100,14 +92,13 @@ class Candles:
         if isinstance(tickers, str):
             tickers = [tickers]
         tickers = clean_tickers(tickers)
-
-        df = self.get_candles(tickers)
-        rows = (
-            df.group_by("ticker")
-            .agg(pl.col(select_col).sort_by("date").last().alias(alias))
-            .iter_rows()
-        )
-        return {ticker: price for ticker, price in rows}
+        start = (dt.date.today() - dt.timedelta(days=7)).isoformat()
+        self._ensure_fresh(tickers, start=start)
+        df = self.conn.execute(
+            f"SELECT ticker, arg_max({select_col}, date) AS {alias} FROM candles WHERE ticker = ANY($1) AND interval = $2 GROUP BY ticker",
+            [tickers, "1d"],
+        ).pl()
+        return {row[0]: row[1] for row in df.iter_rows()}
 
     def get_first_price(
         self, tickers: list[str], select_col: str = "close", alias: str = "value"
@@ -115,14 +106,12 @@ class Candles:
         if isinstance(tickers, str):
             tickers = [tickers]
         tickers = clean_tickers(tickers)
-
-        df = self.get_candles(tickers)
-        rows = (
-            df.group_by("ticker")
-            .agg(pl.col(select_col).sort_by("date").first().alias(alias))
-            .iter_rows()
-        )
-        return {ticker: price for ticker, price in rows}
+        self._ensure_fresh(tickers)
+        df = self.conn.execute(
+            f"SELECT ticker, arg_min({select_col}, date) AS {alias} FROM candles WHERE ticker = ANY($1) AND interval = $2 GROUP BY ticker",
+            [tickers, "1d"],
+        ).pl()
+        return {row[0]: row[1] for row in df.iter_rows()}
 
     def _download_candles(
         self,
@@ -171,7 +160,11 @@ class Candles:
             "volume",
         ]
         cols_to_select = [c for c in target_cols if c in df.columns]
-        return df.select(cols_to_select)
+        df = df.select(cols_to_select)
+        df = df.with_columns(
+            pl.lit(dt.datetime.now(dt.timezone.utc)).alias("collected_at")
+        )
+        return df
 
     def _read_candles(
         self, tickers: list[str], interval: str, start: str = None, end: str = None
@@ -187,37 +180,32 @@ class Candles:
         query += " ORDER BY date, ticker"
         return self.conn.execute(query, params).pl()
 
-    def _get_latest_dates(self, tickers: list[str], interval: str) -> dict[str, str]:
-        df = self.conn.execute(
-            "SELECT ticker, MAX(date) as latest_date FROM candles WHERE ticker = ANY($1) AND interval = $2 GROUP BY ticker",
-            [tickers, interval],
-        ).pl()
-        return {row[0]: row[1] for row in df.iter_rows()}
+    def _has_candles(self, tickers: list[str], interval: str) -> bool:
+        return (
+            self.conn.execute(
+                "SELECT 1 FROM candles WHERE ticker = ANY($1) AND interval = $2 LIMIT 1",
+                [tickers, interval],
+            ).fetchone()
+            is not None
+        )
 
-    def _get_earliest_dates(self, tickers: list[str], interval: str) -> dict[str, str]:
-        df = self.conn.execute(
-            "SELECT ticker, MIN(date) as earliest_date FROM candles WHERE ticker = ANY($1) AND interval = $2 GROUP BY ticker",
-            [tickers, interval],
-        ).pl()
-        return {row[0]: row[1] for row in df.iter_rows()}
-
-    def _get_latest_prices(
-        self, tickers: list[str], interval: str = "1d"
-    ) -> dict[str, float]:
+    def _get_ticker_stats(
+        self, tickers: list[str], interval: str
+    ) -> dict[str, tuple]:
         df = self.conn.execute(
             """
-            SELECT c.ticker, c.close
-            FROM candles c
-            INNER JOIN (
-                SELECT ticker, MAX(date) as max_date
-                FROM candles
-                WHERE ticker = ANY($1) AND interval = $2
-                GROUP BY ticker
-            ) latest ON c.ticker = latest.ticker AND c.date = latest.max_date AND c.interval = $3
-        """,
-            [tickers, interval, interval],
+            SELECT
+                ticker,
+                MAX(date)                        AS latest_candle,
+                MAX(COALESCE(collected_at, date)) AS latest_collected,
+                MIN(date)                        AS earliest_candle
+            FROM candles
+            WHERE ticker = ANY($1) AND interval = $2
+            GROUP BY ticker
+            """,
+            [tickers, interval],
         ).pl()
-        return {row[0]: row[1] for row in df.iter_rows()}
+        return {row[0]: (row[1], row[2], row[3]) for row in df.iter_rows()}
 
     def _insert_candles(self, df: pl.DataFrame):
         if df.is_empty():
@@ -231,13 +219,17 @@ class Candles:
             "low",
             "close",
             "volume",
+            "collected_at",
         ]
-        insert_data(
-            df,
-            db_cols=db_cols,
-            table_name=self.table_name,
-            conn=self.conn,
-            pk_cols=["date", "ticker", "interval"],
+        final_cols = [c for c in db_cols if c in df.columns]
+        df = df.select(final_cols)
+        col_names = ", ".join(final_cols)
+        self.conn.execute(
+            f"""
+            INSERT INTO candles ({col_names})
+            SELECT {col_names} FROM df
+            ON CONFLICT (date, ticker, interval) DO UPDATE SET collected_at = excluded.collected_at
+            """
         )
 
     @staticmethod
@@ -270,9 +262,10 @@ class Candles:
     @staticmethod
     def _parse_date(date_val) -> dt.datetime:
         if isinstance(date_val, dt.datetime):
-            return date_val
+            return date_val if date_val.tzinfo else date_val.replace(tzinfo=dt.timezone.utc)
         if isinstance(date_val, dt.date):
-            return dt.datetime.combine(date_val, dt.time())
+            return dt.datetime.combine(date_val, dt.time(), tzinfo=dt.timezone.utc)
         if isinstance(date_val, str):
-            return dt.datetime.strptime(date_val.split(" ")[0], "%Y-%m-%d")
-        return dt.datetime.now()
+            parsed = dt.datetime.fromisoformat(date_val)
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
+        return dt.datetime.now(dt.timezone.utc)
