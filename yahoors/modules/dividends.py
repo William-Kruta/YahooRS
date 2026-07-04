@@ -1,12 +1,11 @@
-from yahoors import Candles
 import yfinance as yf
 import polars as pl
 import pandas as pd
 import datetime as dt
 
+from .candles import Candles
 from ..periphery.db import _init_tables, insert_data
 from ..periphery.utils import clean_tickers, list_difference
-from ..periphery.stale import get_stale_threshold
 
 
 class Dividends:
@@ -14,16 +13,16 @@ class Dividends:
         self.conn = _init_tables(db_path)
         self.table_name = "dividends"
         self.debug = debug
+        self.candles = Candles(db_path, debug=debug)
 
     def get_dividends(self, tickers: list[str]) -> pl.DataFrame:
         if isinstance(tickers, str):
             tickers = [tickers]
         tickers = clean_tickers(tickers)
-        info = self.get_dividend_info(tickers)
-        valid_tickers = info.filter(pl.col("status") == True)["ticker"].to_list()
-        invalid_tickers = info.filter(pl.col("status") == False)["ticker"].to_list()
+        # Ensures dividend data exists locally for every requested ticker
+        # (downloads and inserts any that are missing).
+        self.get_dividend_info(tickers)
         df = self._read_dividends(tickers)
-        local_tickers = df["ticker"].unique().to_list()
         if df.is_empty():
             fresh = self._download_dividends(tickers)
             self.update_dividend_info(tickers, fresh)
@@ -34,8 +33,7 @@ class Dividends:
     def _download_dividends(self, tickers: list[str]) -> pl.DataFrame:
         if isinstance(tickers, str):
             tickers = [tickers]
-        candles = Candles()
-        candle_df = candles.get_candles(tickers, interval="1d", period="max")
+        candle_df = self.candles.get_candles(tickers, interval="1d", period="max")
         dividends = []
         for t in tickers:
             obj = yf.Ticker(t)

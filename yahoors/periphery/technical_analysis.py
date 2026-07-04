@@ -2,26 +2,21 @@ import polars as pl
 
 
 def add_indicators(df: pl.DataFrame) -> pl.DataFrame:
+    # All window ops are scoped per ticker so multi-ticker frames don't blend series.
     return (
         df.lazy()
+        .sort(["ticker", "date"])
         # SMA
         .with_columns(
             [
-                pl.col("close").rolling_mean(window_size=20).alias("sma_20"),
-                pl.col("close").rolling_mean(window_size=50).alias("sma_50"),
-                pl.col("close").rolling_mean(window_size=200).alias("sma_200"),
-            ]
-        )
-        # EMA
-        .with_columns(
-            [
-                pl.col("close").ewm_mean(span=10, adjust=True).alias("ema_10"),
-                pl.col("close").ewm_mean(span=20, adjust=True).alias("ema_20"),
+                pl.col("close").rolling_mean(window_size=20).over("ticker").alias("sma_20"),
+                pl.col("close").rolling_mean(window_size=50).over("ticker").alias("sma_50"),
+                pl.col("close").rolling_mean(window_size=200).over("ticker").alias("sma_200"),
             ]
         )
         # Bollinger Bands
         .with_columns(
-            pl.col("close").rolling_std(window_size=20).alias("std_20"),
+            pl.col("close").rolling_std(window_size=20).over("ticker").alias("std_20"),
         )
         .with_columns(
             [
@@ -33,22 +28,22 @@ def add_indicators(df: pl.DataFrame) -> pl.DataFrame:
         # MACD
         .with_columns(
             [
-                pl.col("close").ewm_mean(span=12, adjust=True).alias("ema_12"),
-                pl.col("close").ewm_mean(span=26, adjust=True).alias("ema_26"),
+                pl.col("close").ewm_mean(span=12, adjust=True).over("ticker").alias("ema_12"),
+                pl.col("close").ewm_mean(span=26, adjust=True).over("ticker").alias("ema_26"),
             ]
         )
         .with_columns(
             (pl.col("ema_12") - pl.col("ema_26")).alias("macd"),
         )
         .with_columns(
-            pl.col("macd").ewm_mean(span=9, adjust=True).alias("macd_signal"),
+            pl.col("macd").ewm_mean(span=9, adjust=True).over("ticker").alias("macd_signal"),
         )
         .with_columns(
             (pl.col("macd") - pl.col("macd_signal")).alias("macd_histogram"),
         )
         # RSI
         .with_columns(
-            pl.col("close").diff(1).alias("diff"),
+            pl.col("close").diff(1).over("ticker").alias("diff"),
         )
         .with_columns(
             [
@@ -64,8 +59,8 @@ def add_indicators(df: pl.DataFrame) -> pl.DataFrame:
         )
         .with_columns(
             [
-                pl.col("gain").ewm_mean(span=14, adjust=True).alias("avg_gain"),
-                pl.col("loss").ewm_mean(span=14, adjust=True).alias("avg_loss"),
+                pl.col("gain").ewm_mean(span=14, adjust=True).over("ticker").alias("avg_gain"),
+                pl.col("loss").ewm_mean(span=14, adjust=True).over("ticker").alias("avg_loss"),
             ]
         )
         .with_columns(
@@ -74,7 +69,7 @@ def add_indicators(df: pl.DataFrame) -> pl.DataFrame:
             ),
         )
         # ATR
-        .with_columns(pl.col("close").shift(1).alias("prev_close"))
+        .with_columns(pl.col("close").shift(1).over("ticker").alias("prev_close"))
         .with_columns(
             [
                 (pl.col("high") - pl.col("low")).alias("tr1"),
@@ -86,7 +81,7 @@ def add_indicators(df: pl.DataFrame) -> pl.DataFrame:
             pl.max_horizontal("tr1", "tr2", "tr3").alias("tr"),
         )
         .with_columns(
-            pl.col("tr").rolling_mean(window_size=14).alias("atr"),
+            pl.col("tr").rolling_mean(window_size=14).over("ticker").alias("atr"),
         )
         # Select final columns
         .select(

@@ -7,7 +7,7 @@ from typing import Literal
 from .candles import Candles
 from .earnings import Earnings
 from ..periphery.db import _init_tables, insert_data
-from ..periphery.utils import clean_tickers, is_stale, list_difference
+from ..periphery.utils import clean_tickers, list_difference
 from ..periphery.greeks import add_greeks_to_df
 
 
@@ -65,8 +65,8 @@ class Options:
     def _calc_date_deltas(
         self,
         dates: list[str],
-        min_dte: int,
         max_dte: int,
+        min_dte: int = 0,
         ref_date: str = None,
         date_format: str = "%Y-%m-%d",
     ) -> dict[str, int]:
@@ -122,16 +122,17 @@ class Options:
             stock_price = prices[t]
             for k, v in dates.items():
                 chain = obj.option_chain(k)
-                if option_type.lower() == "call" or option_type.lower() == "*":
+                if option_type.lower() in ("call", "*"):
                     calls = self._iterate_chain_type(
                         chain.calls, "call", t, stock_price
                     )
                     data.append(calls)
-                elif option_type.lower() == "put" or option_type.lower() == "*":
+                if option_type.lower() in ("put", "*"):
                     puts = self._iterate_chain_type(chain.puts, "put", t, stock_price)
                     data.append(puts)
 
-        # df = pd.concat(data)
+        if not data:
+            return pl.DataFrame()
         df = pl.from_pandas(pd.concat(data))
         df = df.with_columns(
             pl.lit(dt.datetime.now(dt.timezone.utc)).alias("collected_at")
@@ -235,18 +236,18 @@ class Options:
             tickers = [tickers]
 
         risk_free_rate = self.candles.get_last_price(["^TNX"])["^TNX"] / 100.0
+        prices = self.candles.get_last_price(tickers)
         data = []
 
         for t in tickers:
             try:
                 obj = yf.Ticker(t)
-                last_price = self.candles.get_candles([t])
-                if not expirations:
-                    expirations = obj.options
-                    if get_latest:
-                        expirations = [expirations[0]]
+                stock_price = prices.get(t)
+                ticker_expirations = expirations or obj.options
+                if not expirations and get_latest:
+                    ticker_expirations = [ticker_expirations[0]]
 
-                for exp in expirations:
+                for exp in ticker_expirations:
                     try:
                         chain = obj.option_chain(exp)
                         calls = chain.calls
@@ -255,14 +256,14 @@ class Options:
                         puts["ticker"] = t
                         calls["option_type"] = "call"
                         puts["option_type"] = "put"
-                        calls["stock_price"] = last_price
-                        puts["stock_price"] = last_price
+                        calls["stock_price"] = stock_price
+                        puts["stock_price"] = stock_price
                         data.append(calls)
                         data.append(puts)
                     except ValueError:
                         continue
             except Exception:
-                break
+                continue
         if not data:
             return pl.DataFrame()
         df = pl.from_pandas(pd.concat(data))
@@ -436,6 +437,11 @@ class Options:
     def _insert_options(self, df: pl.DataFrame):
         if df.is_empty():
             return
+        # Greeks columns are NOT NULL in the schema; a contract with no solvable
+        # IV would abort the whole batch insert, so keep it out of the DB.
+        df = df.filter(pl.col("delta").is_not_null())
+        if df.is_empty():
+            return
 
         db_cols = [
             "contract_symbol",
@@ -479,25 +485,21 @@ class Options:
             return options_df.with_columns(pl.lit(None).cast(pl.Int64).alias("dtr"))
 
         today = dt.datetime.now(dt.timezone.utc).date()
-        latest_earnings = earnings_df.group_by("ticker").agg(
-            pl.col("earnings_date").max().alias("earnings_date")
-        )
-        latest_earnings = latest_earnings.with_columns(
-            pl.col("earnings_date")
-            .map_elements(
-                lambda value: (
-                    (
-                        (value.date() if isinstance(value, dt.datetime) else value)
-                        - today
-                    ).days
-                    if value is not None
-                    else None
-                ),
-                return_dtype=pl.Int64,
+        # dtr = days until the NEXT upcoming report; tickers with no future
+        # earnings date on record get a null dtr via the left join.
+        next_earnings = (
+            earnings_df.filter(pl.col("earnings_date").dt.date() >= today)
+            .group_by("ticker")
+            .agg(pl.col("earnings_date").min().alias("earnings_date"))
+            .with_columns(
+                (pl.col("earnings_date").dt.date() - pl.lit(today))
+                .dt.total_days()
+                .cast(pl.Int64)
+                .alias("dtr")
             )
-            .alias("dtr")
-        ).select(["ticker", "dtr"])
-        return options_df.join(latest_earnings, on="ticker", how="left")
+            .select(["ticker", "dtr"])
+        )
+        return options_df.join(next_earnings, on="ticker", how="left")
 
 
 def parse_expiration(contract: str) -> str:

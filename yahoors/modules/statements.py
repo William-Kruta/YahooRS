@@ -75,7 +75,6 @@ class Statements:
         if df.is_empty():
             for ticker in tickers:
                 fresh = self._download_statements(ticker, statement, period)
-                fresh = fresh.fill_null(0)
                 self._insert_statements(fresh)
         else:
             db_tickers = df["ticker"].unique().to_list()
@@ -103,9 +102,7 @@ class Statements:
                     self._insert_statements(fresh)
 
         df = self._read_statements(tickers, statement=statement, period=period)
-        pivoted = df.pivot(on="date", index=["ticker", "label"], values="value")
 
-        # Reverse the date columns (everything after ticker and label)
         def quarter_end(d):
             q = (d.month - 1) // 3 + 1
             end_month = q * 3
@@ -141,6 +138,8 @@ class Statements:
                     .alias("quarter")
                 )
             pivoted = df.pivot(on="quarter", index=["ticker", "label"], values="value")
+        else:
+            pivoted = df.pivot(on="date", index=["ticker", "label"], values="value")
         fixed_cols = ["ticker", "label"]
         date_cols = [c for c in pivoted.columns if c not in fixed_cols]
         pivoted = pivoted.select(fixed_cols + sorted(date_cols))
@@ -171,7 +170,10 @@ class Statements:
                 ["date", "ticker", "label", "value", "statement_type", "period"]
             ]
             data.append(melted)
-        return pl.from_pandas(pd.concat(data))
+        # value is NOT NULL in the schema; yfinance leaves gaps as NaN
+        return pl.from_pandas(pd.concat(data)).with_columns(
+            pl.col("value").fill_null(0)
+        )
 
     def _read_statements(
         self, tickers: list[str], statement: str, period: str
@@ -295,20 +297,45 @@ class Statements:
         CASH_AND_CASH_EQUIVALENTS = "Cash And Cash Equivalents"
         INVENTORY = "Inventory"
         avg_values = {}
-        yf_keys = [REVENUE, COGS, NET_INCOME, EBITDA, INVENTORY, AR, AP]
         if period == "Q":
+            # Flow items live on the income statement and are annualized as a
+            # trailing-4-quarter (TTM) sum; balance items are point-in-time and
+            # get a trailing average instead.
+            flow_items = [
+                ("revenue", REVENUE),
+                ("cogs", COGS),
+                ("net_income", NET_INCOME),
+                ("ebitda", EBITDA),
+            ]
+            balance_items = [
+                ("inventory", INVENTORY),
+                ("accounts receivable", AR),
+                ("accounts payable", AP),
+            ]
             for ticker in tickers:
-                bs = balance_sheet_df.filter(pl.col("ticker") == ticker)
-                for key in yf_keys:
-                    inv_row = bs.filter(pl.col("label") == key)
-                    if not inv_row.is_empty():
-                        vals = inv_row.select(date_cols_bs).row(0)
-                        dates = date_cols_bs
-                        rolling = {}
-                        for i, d in enumerate(dates):
-                            window = [v for v in vals[max(0, i - 3):i + 1] if v is not None]
-                            rolling[d] = sum(window) / len(window) if window else None
-                        avg_values[(ticker, key.lower())] = rolling
+                inc_t = income_df.filter(pl.col("ticker") == ticker)
+                bs_t = balance_sheet_df.filter(pl.col("ticker") == ticker)
+                for lookup_key, label in flow_items:
+                    row = inc_t.filter(pl.col("label") == label)
+                    if row.is_empty():
+                        continue
+                    vals = row.select(date_cols_income).row(0)
+                    rolling = {}
+                    for i, d in enumerate(date_cols_income):
+                        window = [v for v in vals[max(0, i - 3):i + 1] if v is not None]
+                        # TTM needs a full 4 quarters; partial sums understate the year
+                        rolling[d] = sum(window) if len(window) == 4 else None
+                    avg_values[(ticker, lookup_key)] = rolling
+                for lookup_key, label in balance_items:
+                    row = bs_t.filter(pl.col("label") == label)
+                    if row.is_empty():
+                        continue
+                    vals = row.select(date_cols_bs).row(0)
+                    rolling = {}
+                    for i, d in enumerate(date_cols_bs):
+                        window = [v for v in vals[max(0, i - 3):i + 1] if v is not None]
+                        rolling[d] = sum(window) / len(window) if window else None
+                    avg_values[(ticker, lookup_key)] = rolling
 
         results = []
 
@@ -637,10 +664,10 @@ class Statements:
                 SHARES, "income_statement"
             ),
             "ebitda_per_share": ("EBITDA", SHARES, "income_statement"),
-            # Balance Sheet 
-            "cash_per_share": ("Cash and Cash Equivalents", SHARES, "balance_sheet"),
+            # Balance Sheet
+            "cash_per_share": ("Cash And Cash Equivalents", SHARES, "balance_sheet"),
             "debt_per_share": ("Total Debt", SHARES, "balance_sheet"),
-            "equity_per_share": ("Total Equity", SHARES, "balance_sheet"),
+            "equity_per_share": ("Stockholders Equity", SHARES, "balance_sheet"),
             # Cash Flow
             "fcf_per_share": ("Free Cash Flow", SHARES, "cash_flow"),
         }
@@ -666,6 +693,8 @@ class Statements:
                     continue
 
                 for date_col in date_cols:
+                    if date_col not in num_row.columns:
+                        continue
                     num = num_row[date_col].item()
                     den = den_row[date_col].item()
 
@@ -692,7 +721,6 @@ class Statements:
         cash_flow = self.get_statement(
             tickers=tickers, statement="cash_flow", period=period
         )
-        date_cols = [c for c in income_statement.columns if c not in ("ticker", "label")]
 
         growth_labels = {
             # Income Statement
@@ -733,9 +761,13 @@ class Statements:
                 if row.is_empty():
                     continue
 
-                for i in range(lookback, len(date_cols)):
-                    current_col = date_cols[i]
-                    prior_col = date_cols[i - lookback]
+                # Each statement pivot can carry its own set of date columns
+                src_date_cols = sorted(
+                    c for c in df.columns if c not in ("ticker", "label")
+                )
+                for i in range(lookback, len(src_date_cols)):
+                    current_col = src_date_cols[i]
+                    prior_col = src_date_cols[i - lookback]
 
                     current_val = row[current_col].item()
                     prior_val = row[prior_col].item()
@@ -767,9 +799,12 @@ class Statements:
             if ocf_row.is_empty() or capex_row.is_empty():
                 continue
 
-            for i in range(lookback, len(date_cols)):
-                current_col = date_cols[i]
-                prior_col = date_cols[i - lookback]
+            cf_date_cols = sorted(
+                c for c in cash_flow.columns if c not in ("ticker", "label")
+            )
+            for i in range(lookback, len(cf_date_cols)):
+                current_col = cf_date_cols[i]
+                prior_col = cf_date_cols[i - lookback]
 
                 ocf_curr = ocf_row[current_col].item()
                 capex_curr = capex_row[current_col].item()

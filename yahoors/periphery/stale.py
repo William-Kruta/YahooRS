@@ -154,7 +154,7 @@ def get_stale_threshold(interval: str) -> dt.timedelta:
     if is_market_open():
         return base
 
-    now = dt.datetime.now(dt.timezone(dt.timedelta(hours=-4)))
+    now = dt.datetime.now(_ET)
     time_until_open = next_market_open(now) - now
 
     is_intraday = interval in ("1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h")

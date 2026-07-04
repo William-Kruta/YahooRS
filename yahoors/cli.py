@@ -8,7 +8,7 @@ from .modules.earnings import Earnings
 from .modules.options import Options
 from .modules.screener import options_screener
 from .modules.statements import Statements
-from .modules.tickers import Tickers
+from .modules.tickers import Ticker
 from .periphery.config import get_db_path
 from .periphery.utils import clean_tickers
 from .periphery.technical_analysis import add_indicators
@@ -63,7 +63,9 @@ def cmd_options_screener(args):
     options = Options(db_path)
     tickers = clean_tickers(args.symbols)
 
-    options_df = options.get_options(tickers, get_latest=True)
+    options_df = options.get_options(
+        tickers, get_latest=True, force_update=args.force_update
+    )
 
     results = options_screener(
         options_df,
@@ -108,16 +110,10 @@ def cmd_statements(args):
     }
     statement_type = type_map.get(args.statement_type, args.statement_type)
 
-    df = statements.get_statement(tickers, statement_type, period)
-    pivoted = statements.pivot_statement(df, period)
-
     if args.ratios:
-        income_pivoted = statements.pivot_statement(
-            statements.get_statement(tickers, "income_statement", period), period
-        )
-        balance_pivoted = statements.pivot_statement(
-            statements.get_statement(tickers, "balance_sheet", period), period
-        )
+        # get_statement returns the pivoted (ticker, label, dates...) frame
+        income_pivoted = statements.get_statement(tickers, "income_statement", period)
+        balance_pivoted = statements.get_statement(tickers, "balance_sheet", period)
         candles_df = candles.get_candles(tickers)
         ratios = statements.get_ratios(
             tickers,
@@ -129,18 +125,16 @@ def cmd_statements(args):
         print(ratios)
 
     elif args.margins:
-        margins = statements.get_margins(pivoted)
-        print(margins)
+        print(statements.get_margins(tickers, period))
 
     else:
-        print(pivoted)
+        print(statements.get_statement(tickers, statement_type, period))
 
 
 def cmd_info(args):
     db_path = str(get_db_path())
-    tickers_mod = Tickers(db_path)
-    info = tickers_mod.get_info([args.ticker])
-    print(info)
+    ticker = clean_tickers([args.ticker])[0]
+    print(Ticker(ticker, db_path=db_path).info)
 
 
 def main():

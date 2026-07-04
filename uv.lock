@@ -1142,7 +1142,7 @@ wheels = [
 
 [[package]]
 name = "yahoors"
-version = "0.1.9"
+version = "0.1.91"
 source = { editable = "." }
 dependencies = [
     { name = "build" },

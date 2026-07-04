@@ -110,17 +110,17 @@ class Earnings:
     def get_earnings_dates(
         self, tickers: list[str], force_update: bool = False
     ) -> pl.DataFrame:
-        return self._get(tickers, schema_key="dates")
+        return self._get(tickers, schema_key="dates", force_update=force_update)
 
     def get_earnings_estimates(
         self, tickers: list[str], force_update: bool = False
     ) -> pl.DataFrame:
-        return self._get(tickers, schema_key="estimates")
+        return self._get(tickers, schema_key="estimates", force_update=force_update)
 
     def get_earnings_history(
         self, tickers: list[str], force_update: bool = False
     ) -> pl.DataFrame:
-        return self._get(tickers, schema_key="history")
+        return self._get(tickers, schema_key="history", force_update=force_update)
 
     # ── Core get logic ──────────────────────────────────────────
 
@@ -187,6 +187,8 @@ class Earnings:
     def _download_earnings(self, tickers: list[str]) -> dict[str, pl.DataFrame]:
         if isinstance(tickers, str):
             tickers = [tickers]
+        if not tickers:
+            return {}
 
         with ThreadPoolExecutor(max_workers=min(8, len(tickers))) as pool:
             results = list(pool.map(_fetch_one, tickers))
@@ -206,7 +208,7 @@ class Earnings:
         if "estimates" in output and not output["estimates"].is_empty():
             output["estimates"] = resolve_earnings_periods(output["estimates"])
             output["estimates"] = output["estimates"].with_columns(
-                pl.lit(dt.datetime.now()).alias("collected_at")
+                pl.lit(dt.datetime.now(dt.timezone.utc)).alias("collected_at")
             )
 
         return output

@@ -120,6 +120,9 @@ def implied_volatility(
 
         diff = bs_price - market_price
 
+        if abs(diff) < tol:
+            return sigma
+
         # Vega (not scaled by 100 here, we need the raw derivative)
         vega = s * pdf(d1) * math.sqrt(t)
 
@@ -130,9 +133,6 @@ def implied_volatility(
 
         # Clamp to reasonable bounds
         sigma = max(sigma, 1e-6)
-
-        if abs(diff) < tol:
-            return sigma
 
     # If we didn't converge, return the last estimate if reasonable, else 0
     return sigma if 0.001 < sigma < 10.0 else 0.0

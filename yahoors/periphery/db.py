@@ -1,4 +1,3 @@
-import pandas as pd
 import polars as pl
 import duckdb
 from .config import get_db_path

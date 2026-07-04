@@ -115,6 +115,7 @@ class WebSocket:
             raise errors[0]
 
     def close(self):
+        self._closed = True
         try:
             self.ws.close()
         finally:

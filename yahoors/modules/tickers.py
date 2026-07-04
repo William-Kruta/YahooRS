@@ -13,11 +13,11 @@ COMPANY_INFO_DYNAMIC_STALE_THRESHOLD = dt.timedelta(days=90)
 
 
 class Ticker:
-    def __init__(self, ticker: str):
+    def __init__(self, ticker: str, db_path: str = None):
         self.ticker = ticker
-        self.conn = _init_tables()
+        self.conn = _init_tables(db_path)
         self.table_name = "company_info"
-        self._statements_obj = Statements()
+        self._statements_obj = Statements(db_path=db_path)
         self._cache: dict[str, pl.DataFrame] = {}
 
     def _get_cached(self, key: str, fetcher) -> pl.DataFrame:
@@ -421,7 +421,7 @@ def _download_ticker_info(
                 }
             )
         except Exception:
-            break
+            continue
 
     df = pl.DataFrame(data)
     now_utc = dt.datetime.now(dt.timezone.utc)

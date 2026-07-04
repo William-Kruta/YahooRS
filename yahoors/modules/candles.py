@@ -130,7 +130,8 @@ class Candles:
         else:
             params = {"period": period}
 
-        print(f"Ticker: {tickers}   Params: {params}")
+        if self.debug:
+            print(f"Ticker: {tickers}   Params: {params}")
         data = yf.download(tickers, interval=interval, **params)
         if data.empty:
             return pl.DataFrame()

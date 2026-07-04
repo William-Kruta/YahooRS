@@ -228,11 +228,11 @@ class YahooRSAPI:
         return _frame_response(df)
 
     def get_ticker_info(self, ticker: str) -> dict[str, Any]:
-        df = Ticker(ticker).info
+        df = Ticker(ticker, db_path=self.db_path).info
         return _frame_response(df)
 
     def get_ticker_trading_status(self, ticker: str) -> dict[str, Any]:
-        df = Ticker(ticker).trading_status
+        df = Ticker(ticker, db_path=self.db_path).trading_status
         return _frame_response(df)
 
 
