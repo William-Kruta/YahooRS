@@ -113,9 +113,9 @@ def _init_tables(db_path: str = None) -> duckdb.DuckDBPyConnection:
             number_of_analysts  INTEGER,
             growth              DOUBLE,
             label               VARCHAR,
-            period_label        VARCHAR,
+            period_label        VARCHAR NOT NULL DEFAULT '',
             collected_at        TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (period, ticker, collected_at)
+            PRIMARY KEY (period, period_label, ticker, collected_at)
         );
 
         CREATE TABLE IF NOT EXISTS earnings_history (
@@ -154,7 +154,58 @@ def _init_tables(db_path: str = None) -> duckdb.DuckDBPyConnection:
     conn.execute(
         "ALTER TABLE candles ADD COLUMN IF NOT EXISTS collected_at TIMESTAMPTZ"
     )
+    _migrate_earnings_estimates_pk(conn)
     return conn
+
+
+def _migrate_earnings_estimates_pk(conn):
+    # earnings_estimates was originally keyed (period, ticker, collected_at), but a
+    # quarterly and an annual estimate can resolve to the same period date (e.g. Q4
+    # 2026 and FY 2026 both resolve to 2026-12-31), so period_label must be part of
+    # the key. DuckDB cannot alter primary keys — rebuild the table once if the old
+    # key is present.
+    old_pk = conn.execute(
+        """
+        SELECT count(*) FROM duckdb_constraints()
+        WHERE table_name = 'earnings_estimates'
+          AND constraint_type = 'PRIMARY KEY'
+          AND constraint_column_names = ['period', 'ticker', 'collected_at']
+        """
+    ).fetchone()[0]
+    if not old_pk:
+        return
+    conn.execute("BEGIN TRANSACTION")
+    conn.execute(
+        """
+        CREATE TABLE earnings_estimates_migrated (
+            period              VARCHAR NOT NULL,
+            ticker              VARCHAR NOT NULL,
+            avg                 DOUBLE,
+            low                 DOUBLE,
+            high                DOUBLE,
+            year_ago_eps        DOUBLE,
+            number_of_analysts  INTEGER,
+            growth              DOUBLE,
+            label               VARCHAR,
+            period_label        VARCHAR NOT NULL DEFAULT '',
+            collected_at        TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (period, period_label, ticker, collected_at)
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO earnings_estimates_migrated
+        SELECT period, ticker, avg, low, high, year_ago_eps, number_of_analysts,
+               growth, label, COALESCE(period_label, ''), collected_at
+        FROM earnings_estimates
+        """
+    )
+    conn.execute("DROP TABLE earnings_estimates")
+    conn.execute(
+        "ALTER TABLE earnings_estimates_migrated RENAME TO earnings_estimates"
+    )
+    conn.execute("COMMIT")
 
 
 def insert_data(

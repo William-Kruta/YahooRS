@@ -67,7 +67,7 @@ SCHEMAS = {
     "estimates": TableSchema(
         table_name="earnings_estimates",
         yf_attr="earnings_estimate",
-        pk_cols=[],
+        pk_cols=["period", "period_label", "ticker", "collected_at"],
         columns=[
             Column("period"),
             Column("ticker"),
