@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from .candles import Candles
 from ..periphery.db import _init_tables, insert_data
-from ..periphery.utils import clean_tickers, list_difference
+from ..periphery.utils import clean_tickers
 
 
 # ── Schema Definitions ──────────────────────────────────────────────
@@ -62,6 +62,7 @@ SCHEMAS = {
             Column("eps_estimate", "EPS Estimate"),
             Column("reported_eps", "Reported EPS"),
             Column("surprise_pct", "Surprise(%)"),
+            Column("collected_at"),
         ],
     ),
     "estimates": TableSchema(
@@ -93,6 +94,7 @@ SCHEMAS = {
             Column("eps_estimate", "epsEstimate"),
             Column("eps_difference", "epsDifference"),
             Column("surprise_pct", "surprisePercent"),
+            Column("collected_at"),
         ],
     ),
 }
@@ -105,22 +107,55 @@ class Earnings:
     def __init__(self, db_path: str = None, candles_obj: Candles = None):
         self.conn = _init_tables(db_path)
 
+    def close(self) -> None:
+        self.conn.close()
+
+    def __enter__(self) -> "Earnings":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
     # ── Public getters ──────────────────────────────────────────
 
     def get_earnings_dates(
-        self, tickers: list[str], force_update: bool = False
+        self,
+        tickers: list[str],
+        force_update: bool = False,
+        stale_threshold: dt.timedelta = dt.timedelta(days=1),
     ) -> pl.DataFrame:
-        return self._get(tickers, schema_key="dates", force_update=force_update)
+        return self._get(
+            tickers,
+            schema_key="dates",
+            force_update=force_update,
+            stale_threshold=stale_threshold,
+        )
 
     def get_earnings_estimates(
-        self, tickers: list[str], force_update: bool = False
+        self,
+        tickers: list[str],
+        force_update: bool = False,
+        stale_threshold: dt.timedelta = dt.timedelta(days=90),
     ) -> pl.DataFrame:
-        return self._get(tickers, schema_key="estimates", force_update=force_update)
+        return self._get(
+            tickers,
+            schema_key="estimates",
+            force_update=force_update,
+            stale_threshold=stale_threshold,
+        )
 
     def get_earnings_history(
-        self, tickers: list[str], force_update: bool = False
+        self,
+        tickers: list[str],
+        force_update: bool = False,
+        stale_threshold: dt.timedelta = dt.timedelta(days=30),
     ) -> pl.DataFrame:
-        return self._get(tickers, schema_key="history", force_update=force_update)
+        return self._get(
+            tickers,
+            schema_key="history",
+            force_update=force_update,
+            stale_threshold=stale_threshold,
+        )
 
     # ── Core get logic ──────────────────────────────────────────
 
@@ -128,7 +163,7 @@ class Earnings:
         self,
         tickers: list[str],
         schema_key: str,
-        stale_threshold: dt.timedelta = dt.timedelta(days=90),
+        stale_threshold: dt.timedelta,
         force_update: bool = False,
     ) -> pl.DataFrame:
         if isinstance(tickers, str):
@@ -145,9 +180,7 @@ class Earnings:
         cached_tickers = df["ticker"].unique().to_list()
         missing_tickers = [t for t in tickers if t not in cached_tickers]
 
-        needs_refresh = False
-        if schema_key == "estimates":
-            needs_refresh = self._estimates_are_stale(tickers, stale_threshold)
+        needs_refresh = self._cache_is_stale(tickers, schema_key, stale_threshold)
 
         if missing_tickers or needs_refresh:
             download_list = missing_tickers if not needs_refresh else tickers
@@ -157,13 +190,19 @@ class Earnings:
 
         return df
 
-    def _estimates_are_stale(self, tickers: list[str], threshold: dt.timedelta) -> bool:
+    def _cache_is_stale(
+        self,
+        tickers: list[str],
+        schema_key: str,
+        threshold: dt.timedelta,
+    ) -> bool:
+        table_name = SCHEMAS[schema_key].table_name
         result = self.conn.execute(
-            """
+            f"""
             SELECT MIN(max_collected) as oldest_snapshot
             FROM (
                 SELECT ticker, MAX(collected_at) as max_collected
-                FROM earnings_estimates
+                FROM {table_name}
                 WHERE ticker = ANY($1)
                 GROUP BY ticker
             )
@@ -204,12 +243,14 @@ class Earnings:
             combined = pl.from_pandas(pd.concat(frames), include_index=True)
             output[key] = schema.select_and_rename(combined)
 
-        # Estimates need extra processing
+        # Estimates need extra period processing.
         if "estimates" in output and not output["estimates"].is_empty():
             output["estimates"] = resolve_earnings_periods(output["estimates"])
-            output["estimates"] = output["estimates"].with_columns(
-                pl.lit(dt.datetime.now(dt.timezone.utc)).alias("collected_at")
-            )
+
+        collected_at = dt.datetime.now(dt.timezone.utc)
+        for key, frame in output.items():
+            if not frame.is_empty():
+                output[key] = frame.with_columns(pl.lit(collected_at).alias("collected_at"))
 
         return output
 
@@ -224,15 +265,16 @@ class Earnings:
                 SELECT e.*
                 FROM {schema.table_name} e
                 INNER JOIN (
-                    SELECT ticker, period, MAX(collected_at) as max_collected
+                    SELECT ticker, period, period_label, MAX(collected_at) as max_collected
                     FROM {schema.table_name}
                     WHERE ticker = ANY($1)
-                    GROUP BY ticker, period
+                    GROUP BY ticker, period, period_label
                 ) latest
                 ON e.ticker = latest.ticker
                 AND e.period = latest.period
+                AND e.period_label = latest.period_label
                 AND e.collected_at = latest.max_collected
-                ORDER BY e.ticker, e.period
+                ORDER BY e.ticker, e.period, e.period_label
                 """,
                 [tickers],
             ).pl()
@@ -250,6 +292,21 @@ class Earnings:
         if df.is_empty():
             return
         schema = SCHEMAS[schema_key]
+        if schema_key in ("dates", "history"):
+            df = df.select([column for column in schema.db_cols if column in df.columns])
+            df = df.unique(subset=schema.pk_cols, keep="first")
+            col_names = ", ".join(df.columns)
+            update_cols = [column for column in df.columns if column not in schema.pk_cols]
+            update_set = ", ".join(f"{column} = EXCLUDED.{column}" for column in update_cols)
+            conflict_cols = ", ".join(schema.pk_cols)
+            self.conn.execute(
+                f"""
+                INSERT INTO {schema.table_name} ({col_names})
+                SELECT {col_names} FROM df
+                ON CONFLICT ({conflict_cols}) DO UPDATE SET {update_set}
+                """
+            )
+            return
         insert_data(
             df,
             db_cols=schema.db_cols,

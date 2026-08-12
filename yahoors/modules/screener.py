@@ -3,9 +3,11 @@ import datetime as dt
 from .options import Options
 
 
-def add_yield_columns(df: pl.DataFrame | pl.LazyFrame) -> pl.DataFrame | pl.LazyFrame:
-    return df.with_columns(
-        (pl.col("strike") * 100).alias("collateral"),
+def add_yield_columns(
+    df: pl.DataFrame | pl.LazyFrame,
+    long: bool = False,
+) -> pl.DataFrame | pl.LazyFrame:
+    df = df.with_columns(
         pl.when((pl.col("bid") > 0) & (pl.col("ask") > 0))
         .then((pl.col("bid") + pl.col("ask")) / 2.0)
         .when(pl.col("ask") > 0)
@@ -14,11 +16,26 @@ def add_yield_columns(df: pl.DataFrame | pl.LazyFrame) -> pl.DataFrame | pl.Lazy
         .then(pl.col("bid"))
         .otherwise(pl.col("last_price"))
         .alias("premium"),
+    )
+    return df.with_columns(
+        pl.when(pl.lit(long))
+        .then(pl.col("premium") * 100.0)
+        .when(pl.col("option_type") == "put")
+        .then(pl.col("strike") * 100.0)
+        # Short calls are treated as covered calls by this screener.
+        .otherwise(pl.col("stock_price") * 100.0)
+        .alias("collateral")
     ).with_columns(
-        (pl.col("premium") / pl.col("strike")).alias("roc"),
-        (pl.col("premium") / pl.col("strike") * 365.0 / pl.col("dte")).alias(
-            "annualized_roc"
-        ),
+        pl.when(pl.lit(long))
+        .then(None)
+        .otherwise(pl.col("premium") * 100.0 / pl.col("collateral"))
+        .cast(pl.Float64)
+        .alias("roc"),
+        pl.when(pl.lit(not long) & (pl.col("dte") > 0))
+        .then(pl.col("premium") * 100.0 / pl.col("collateral") * 365.0 / pl.col("dte"))
+        .otherwise(None)
+        .cast(pl.Float64)
+        .alias("annualized_roc"),
     )
 
 
@@ -33,10 +50,10 @@ def cash_secured_puts(
     itm: bool = False,
     max_trade_age: dt.timedelta | None = dt.timedelta(hours=2),
 ) -> pl.DataFrame:
-    op = Options()
-    df = op.get_options_by_dte_range(
-        tickers, min_dte=min_dte, max_dte=max_dte, option_type="put"
-    )
+    with Options() as options:
+        df = options.get_options_by_dte_range(
+            tickers, min_dte=min_dte, max_dte=max_dte, option_type="put"
+        )
     return options_screener(
         df,
         min_dte=min_dte,
@@ -63,16 +80,32 @@ def options_screener(
     min_roc: float = 0.005,
     max_trade_age: dt.timedelta | None = dt.timedelta(hours=2),
 ) -> pl.DataFrame:
+    if min_dte < 0:
+        raise ValueError("min_dte must be non-negative")
+    if max_dte < min_dte:
+        raise ValueError("max_dte must be greater than or equal to min_dte")
+    if min_collateral < 0 or max_collateral < min_collateral:
+        raise ValueError(
+            "collateral bounds must be non-negative and max_collateral must be "
+            "greater than or equal to min_collateral"
+        )
+    if options_df.is_empty():
+        return options_df
+
     side = "long" if long else "short"
     df = (
         options_df.lazy()
         .with_columns(pl.lit(side).alias("side"))
-        # Flip prob_profit for short positions
+        # Flip both probability measures for short positions.
         .with_columns(
             pl.when(pl.lit(long))
             .then(pl.col("prob_profit"))
             .otherwise(1.0 - pl.col("prob_profit"))
-            .alias("prob_profit")
+            .alias("prob_profit"),
+            pl.when(pl.lit(long))
+            .then(pl.col("hist_prob_profit"))
+            .otherwise(1.0 - pl.col("hist_prob_profit"))
+            .alias("hist_prob_profit"),
         )
         # Filter DTE range
         .filter(pl.col("dte").is_between(min_dte, max_dte))
@@ -80,11 +113,15 @@ def options_screener(
         .filter(pl.col("in_the_money") == in_the_money)
         # Short strategies require a non-zero bid (that's the fill price)
         # Long strategies just need any market
-        .filter(pl.col("bid") > 0 if not long else (pl.col("bid") > 0) | (pl.col("ask") > 0) | (pl.col("last_price") > 0))
+        .filter(
+            pl.col("bid") > 0
+            if not long
+            else (pl.col("bid") > 0) | (pl.col("ask") > 0) | (pl.col("last_price") > 0)
+        )
         # Drop contracts where greeks couldn't be computed (no valid IV)
         .filter(pl.col("prob_profit").is_not_null())
         # Collateral, premium, roc, annualized_roc
-        .pipe(add_yield_columns)
+        .pipe(add_yield_columns, long=long)
         # Filter collateral range
         .filter(pl.col("collateral").is_between(min_collateral, max_collateral))
         # Max loss per share (informational — worst case, not used in EV)
@@ -96,16 +133,17 @@ def options_screener(
             .otherwise(pl.col("stock_price") - pl.col("premium"))
             .alias("max_loss_per_share")
         )
-        # Expected return: edge over fair value (premium collected minus BS fair value)
-        # EV = premium - bs_price, normalized by strike
+        # Model edge over fair value, normalized by strike. The direction reverses
+        # for long contracts because the buyer benefits from paying below fair value.
         .with_columns(
-            ((pl.col("premium") - pl.col("bs_price")) / pl.col("strike")).alias(
-                "expected_return"
-            )
+            pl.when(pl.lit(long))
+            .then((pl.col("bs_price") - pl.col("premium")) / pl.col("strike"))
+            .otherwise((pl.col("premium") - pl.col("bs_price")) / pl.col("strike"))
+            .alias("expected_return")
         )
         # Minimum premium and ROC filters
         .filter(pl.col("premium") > min_premium)
-        .filter(pl.col("roc") > min_roc)
+        .filter(pl.lit(long) | (pl.col("roc") > min_roc))
         .sort("expected_return", descending=True)
         .collect()
     )
@@ -118,6 +156,4 @@ def filter_stale_trades(
     df: pl.DataFrame, max_age: dt.timedelta = dt.timedelta(hours=24)
 ) -> pl.DataFrame:
     cutoff = dt.datetime.now(dt.timezone.utc) - max_age
-    return df.filter(
-        pl.col("last_trade_date").cast(pl.Datetime("us", "UTC")) >= pl.lit(cutoff)
-    )
+    return df.filter(pl.col("last_trade_date").cast(pl.Datetime("us", "UTC")) >= pl.lit(cutoff))

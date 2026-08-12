@@ -1,14 +1,31 @@
 import datetime as dt
 
 
-def clean_tickers(tickers: list[str]) -> list[str]: 
+def clean_tickers(tickers: list[str]) -> list[str]:
     mapping = {"/": "-", "\\": "-", "@": "-", ".": "-"}
-    return [ticker.translate(str.maketrans(mapping)) for ticker in tickers]
+    translation = str.maketrans(mapping)
+    normalized = []
+    seen = set()
+    for ticker in tickers:
+        symbol = ticker.strip().upper().translate(translation)
+        if symbol and symbol not in seen:
+            normalized.append(symbol)
+            seen.add(symbol)
+    return normalized
 
-def is_stale(data: dict[str, list[str]], stale_threshold: dt.timedelta, date_format: str = "%Y-%m-%d %H:%M:%S") -> dict[str, bool]:
-    return {date: (dt.datetime.now() - dt.datetime.strptime(date, date_format)) > stale_threshold for date in data}
 
-# def is_stale(data: dict[str, str], stale_threshold: dt.timedelta, date_format: str = "%Y-%m-%d %H:%M:%S") -> dict[str, bool]: 
+def is_stale(
+    data: dict[str, list[str]],
+    stale_threshold: dt.timedelta,
+    date_format: str = "%Y-%m-%d %H:%M:%S",
+) -> dict[str, bool]:
+    return {
+        date: (dt.datetime.now() - dt.datetime.strptime(date, date_format)) > stale_threshold
+        for date in data
+    }
+
+
+# def is_stale(data: dict[str, str], stale_threshold: dt.timedelta, date_format: str = "%Y-%m-%d %H:%M:%S") -> dict[str, bool]:
 #     return {ticker: (dt.datetime.now() - dt.datetime.strptime(date, date_format)) > stale_threshold for ticker, date in data.items()}
 
 

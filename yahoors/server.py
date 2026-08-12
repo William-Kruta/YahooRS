@@ -1,10 +1,14 @@
 import datetime as dt
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
+from functools import wraps
+from threading import RLock
 from typing import Any, Literal
 
 from fastapi import FastAPI, Query
 import uvicorn
 
+from ._version import __version__
 from .modules.candles import Candles
 from .modules.dividends import Dividends
 from .modules.earnings import Earnings
@@ -17,12 +21,28 @@ from .modules.tickers import Ticker
 
 StatementType = Literal["income_statement", "balance_sheet", "cash_flow"]
 EarningsType = Literal["dates", "estimates", "history"]
+CandleValueColumn = Literal["date", "open", "high", "low", "close", "volume", "collected_at"]
 
 
 @dataclass
 class DataFrameResponse:
     rows: list[dict[str, Any]]
     row_count: int
+
+
+def _serialized(method):
+    """Serialize access to the API's shared DuckDB-backed module instances."""
+
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        lock = getattr(self, "_lock", None)
+        if lock is None:
+            lock = RLock()
+            self._lock = lock
+        with lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 def _serialize_value(value: Any) -> Any:
@@ -49,6 +69,7 @@ def _normalize_tickers(tickers: list[str] | str) -> list[str]:
 class YahooRSAPI:
     def __init__(self, db_path: str | None = None):
         self.db_path = db_path
+        self._lock = RLock()
         self.candles = Candles(db_path=db_path, debug=False)
         self.options = Options(db_path=db_path)
         self.statements = Statements(db_path=db_path, candles_obj=self.candles)
@@ -56,32 +77,54 @@ class YahooRSAPI:
         self.dividends = Dividends(db_path=db_path, debug=False)
         self.macro = Macro(db_path=db_path, candles_obj=self.candles)
 
+    @_serialized
+    def close(self) -> None:
+        self.options.close()
+        self.earnings.close()
+        self.dividends.close()
+        self.statements.close()
+        self.macro.close()
+        self.candles.close()
+
+    def __enter__(self) -> "YahooRSAPI":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    @_serialized
     def get_candles(
         self,
         tickers: list[str] | str,
         interval: str = "1d",
         period: str = "max",
+        force_update: bool = False,
     ) -> dict[str, Any]:
         df = self.candles.get_candles(
             tickers=_normalize_tickers(tickers),
             interval=interval,
             period=period,
+            force_update=force_update,
         )
         return _frame_response(df)
 
+    @_serialized
     def get_last_price(
         self,
         tickers: list[str] | str,
-        select_col: str = "close",
+        select_col: CandleValueColumn = "close",
         alias: str = "value",
+        force_update: bool = False,
     ) -> dict[str, Any]:
         values = self.candles.get_last_price(
             tickers=_normalize_tickers(tickers),
             select_col=select_col,
             alias=alias,
+            force_update=force_update,
         )
         return {"data": _serialize_value(values), "count": len(values)}
 
+    @_serialized
     def get_options(
         self,
         tickers: list[str] | str,
@@ -97,6 +140,7 @@ class YahooRSAPI:
         )
         return _frame_response(df)
 
+    @_serialized
     def screen_options(
         self,
         tickers: list[str] | str,
@@ -108,9 +152,10 @@ class YahooRSAPI:
         max_collateral: float = float("inf"),
         force_update: bool = False,
     ) -> dict[str, Any]:
-        options_df = self.options.get_options(
+        options_df = self.options.get_options_by_dte_range(
             tickers=_normalize_tickers(tickers),
-            get_latest=True,
+            min_dte=min_dte,
+            max_dte=max_dte,
             force_update=force_update,
         )
         screened = options_screener(
@@ -124,39 +169,57 @@ class YahooRSAPI:
         )
         return _frame_response(screened)
 
+    @_serialized
     def get_statement(
         self,
         tickers: list[str] | str,
         statement_type: StatementType,
         period: Literal["A", "Q"] = "A",
+        force_update: bool = False,
     ) -> dict[str, Any]:
         df = self.statements.get_statement(
             tickers=_normalize_tickers(tickers),
             statement=statement_type,
             period=period,
+            force_update=force_update,
         )
         return _frame_response(df)
 
+    @_serialized
     def get_margins(
         self,
         tickers: list[str] | str,
         period: Literal["A", "Q"] = "A",
+        force_update: bool = False,
     ) -> dict[str, Any]:
         df = self.statements.get_margins(
             tickers=_normalize_tickers(tickers),
             period=period,
+            force_update=force_update,
         )
         return _frame_response(df)
 
+    @_serialized
     def get_ratios(
         self,
         tickers: list[str] | str,
         period: Literal["A", "Q"] = "A",
+        force_update: bool = False,
     ) -> dict[str, Any]:
         normalized = _normalize_tickers(tickers)
-        income_df = self.statements.get_statement(normalized, "income_statement", period)
-        balance_df = self.statements.get_statement(normalized, "balance_sheet", period)
-        candles_df = self.candles.get_candles(normalized)
+        income_df = self.statements.get_statement(
+            normalized,
+            "income_statement",
+            period,
+            force_update=force_update,
+        )
+        balance_df = self.statements.get_statement(
+            normalized,
+            "balance_sheet",
+            period,
+            force_update=force_update,
+        )
+        candles_df = self.candles.get_candles(normalized, force_update=force_update)
         df = self.statements.get_ratios(
             tickers=normalized,
             income_df=income_df,
@@ -166,10 +229,12 @@ class YahooRSAPI:
         )
         return _frame_response(df)
 
+    @_serialized
     def get_earnings(
         self,
         tickers: list[str] | str,
         earnings_type: EarningsType,
+        force_update: bool = False,
     ) -> dict[str, Any]:
         normalized = _normalize_tickers(tickers)
         method_map = {
@@ -177,13 +242,22 @@ class YahooRSAPI:
             "estimates": self.earnings.get_earnings_estimates,
             "history": self.earnings.get_earnings_history,
         }
-        df = method_map[earnings_type](normalized)
+        df = method_map[earnings_type](normalized, force_update=force_update)
         return _frame_response(df)
 
-    def get_dividends(self, tickers: list[str] | str) -> dict[str, Any]:
-        df = self.dividends.get_dividends(_normalize_tickers(tickers))
+    @_serialized
+    def get_dividends(
+        self,
+        tickers: list[str] | str,
+        force_update: bool = False,
+    ) -> dict[str, Any]:
+        df = self.dividends.get_dividends(
+            _normalize_tickers(tickers),
+            force_update=force_update,
+        )
         return _frame_response(df)
 
+    @_serialized
     def get_risk_free_rate(
         self,
         ticker: str = "^TNX",
@@ -197,6 +271,7 @@ class YahooRSAPI:
         )
         return _frame_response(df)
 
+    @_serialized
     def get_yield_curve(
         self,
         short_term_ticker: str = "2YY=F",
@@ -212,6 +287,7 @@ class YahooRSAPI:
         )
         return _frame_response(df)
 
+    @_serialized
     def get_currency_exchange_rate(
         self,
         currency_a: str,
@@ -227,20 +303,32 @@ class YahooRSAPI:
         )
         return _frame_response(df)
 
+    @_serialized
     def get_ticker_info(self, ticker: str) -> dict[str, Any]:
-        df = Ticker(ticker, db_path=self.db_path).info
+        with Ticker(ticker, db_path=self.db_path) as ticker_obj:
+            df = ticker_obj.info
         return _frame_response(df)
 
+    @_serialized
     def get_ticker_trading_status(self, ticker: str) -> dict[str, Any]:
-        df = Ticker(ticker, db_path=self.db_path).trading_status
+        with Ticker(ticker, db_path=self.db_path) as ticker_obj:
+            df = ticker_obj.trading_status
         return _frame_response(df)
 
 
 def create_app(db_path: str | None = None) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        yield
+        api = getattr(app.state, "api", None)
+        if api is not None:
+            api.close()
+
     app = FastAPI(
         title="YahooRS API",
-        version="0.1.4",
+        version=__version__,
         description="HTTP API for YahooRS market data modules.",
+        lifespan=lifespan,
     )
 
     def get_api() -> YahooRSAPI:
@@ -257,19 +345,27 @@ def create_app(db_path: str | None = None) -> FastAPI:
         tickers: list[str] = Query(...),
         interval: str = "1d",
         period: str = "max",
+        force_update: bool = False,
     ) -> dict[str, Any]:
-        return get_api().get_candles(tickers=tickers, interval=interval, period=period)
+        return get_api().get_candles(
+            tickers=tickers,
+            interval=interval,
+            period=period,
+            force_update=force_update,
+        )
 
     @app.get("/candles/last-price")
     def get_last_price(
         tickers: list[str] = Query(...),
-        select_col: str = "close",
-        alias: str = "value",
+        select_col: CandleValueColumn = "close",
+        alias: str = Query("value", pattern=r"^[A-Za-z_][A-Za-z0-9_]*$"),
+        force_update: bool = False,
     ) -> dict[str, Any]:
         return get_api().get_last_price(
             tickers=tickers,
             select_col=select_col,
             alias=alias,
+            force_update=force_update,
         )
 
     @app.get("/options")
@@ -312,38 +408,61 @@ def create_app(db_path: str | None = None) -> FastAPI:
     def get_margins(
         tickers: list[str] = Query(...),
         period: Literal["A", "Q"] = "A",
+        force_update: bool = False,
     ) -> dict[str, Any]:
-        return get_api().get_margins(tickers=tickers, period=period)
+        return get_api().get_margins(
+            tickers=tickers,
+            period=period,
+            force_update=force_update,
+        )
 
     @app.get("/statements/ratios")
     def get_ratios(
         tickers: list[str] = Query(...),
         period: Literal["A", "Q"] = "A",
+        force_update: bool = False,
     ) -> dict[str, Any]:
-        return get_api().get_ratios(tickers=tickers, period=period)
+        return get_api().get_ratios(
+            tickers=tickers,
+            period=period,
+            force_update=force_update,
+        )
 
     @app.get("/statements/{statement_type}")
     def get_statement(
         statement_type: StatementType,
         tickers: list[str] = Query(...),
         period: Literal["A", "Q"] = "A",
+        force_update: bool = False,
     ) -> dict[str, Any]:
         return get_api().get_statement(
             tickers=tickers,
             statement_type=statement_type,
             period=period,
+            force_update=force_update,
         )
 
     @app.get("/earnings/{earnings_type}")
     def get_earnings(
         earnings_type: EarningsType,
         tickers: list[str] = Query(...),
+        force_update: bool = False,
     ) -> dict[str, Any]:
-        return get_api().get_earnings(tickers=tickers, earnings_type=earnings_type)
+        return get_api().get_earnings(
+            tickers=tickers,
+            earnings_type=earnings_type,
+            force_update=force_update,
+        )
 
     @app.get("/dividends")
-    def get_dividends(tickers: list[str] = Query(...)) -> dict[str, Any]:
-        return get_api().get_dividends(tickers=tickers)
+    def get_dividends(
+        tickers: list[str] = Query(...),
+        force_update: bool = False,
+    ) -> dict[str, Any]:
+        return get_api().get_dividends(
+            tickers=tickers,
+            force_update=force_update,
+        )
 
     @app.get("/macro/risk-free-rate")
     def get_risk_free_rate(

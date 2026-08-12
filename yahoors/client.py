@@ -6,6 +6,7 @@ import polars as pl
 
 StatementType = Literal["income_statement", "balance_sheet", "cash_flow"]
 EarningsType = Literal["dates", "estimates", "history"]
+CandleValueColumn = Literal["date", "open", "high", "low", "close", "volume", "collected_at"]
 
 
 class YahooRSClient:
@@ -40,6 +41,7 @@ class YahooRSClient:
         tickers: list[str] | str,
         interval: str = "1d",
         period: str = "max",
+        force_update: bool = False,
     ) -> pl.DataFrame:
         return self._get_frame(
             "/candles",
@@ -47,14 +49,16 @@ class YahooRSClient:
                 "tickers": _normalize_tickers(tickers),
                 "interval": interval,
                 "period": period,
+                "force_update": force_update,
             },
         )
 
     def get_last_price(
         self,
         tickers: list[str] | str,
-        select_col: str = "close",
+        select_col: CandleValueColumn = "close",
         alias: str = "value",
+        force_update: bool = False,
     ) -> dict[str, Any]:
         payload = self._get_json(
             "/candles/last-price",
@@ -62,6 +66,7 @@ class YahooRSClient:
                 "tickers": _normalize_tickers(tickers),
                 "select_col": select_col,
                 "alias": alias,
+                "force_update": force_update,
             },
         )
         return payload["data"]
@@ -112,46 +117,72 @@ class YahooRSClient:
         tickers: list[str] | str,
         statement_type: StatementType,
         period: Literal["A", "Q"] = "A",
+        force_update: bool = False,
     ) -> pl.DataFrame:
         return self._get_frame(
             f"/statements/{statement_type}",
-            params={"tickers": _normalize_tickers(tickers), "period": period},
+            params={
+                "tickers": _normalize_tickers(tickers),
+                "period": period,
+                "force_update": force_update,
+            },
         )
 
     def get_margins(
         self,
         tickers: list[str] | str,
         period: Literal["A", "Q"] = "A",
+        force_update: bool = False,
     ) -> pl.DataFrame:
         return self._get_frame(
             "/statements/margins",
-            params={"tickers": _normalize_tickers(tickers), "period": period},
+            params={
+                "tickers": _normalize_tickers(tickers),
+                "period": period,
+                "force_update": force_update,
+            },
         )
 
     def get_ratios(
         self,
         tickers: list[str] | str,
         period: Literal["A", "Q"] = "A",
+        force_update: bool = False,
     ) -> pl.DataFrame:
         return self._get_frame(
             "/statements/ratios",
-            params={"tickers": _normalize_tickers(tickers), "period": period},
+            params={
+                "tickers": _normalize_tickers(tickers),
+                "period": period,
+                "force_update": force_update,
+            },
         )
 
     def get_earnings(
         self,
         tickers: list[str] | str,
         earnings_type: EarningsType,
+        force_update: bool = False,
     ) -> pl.DataFrame:
         return self._get_frame(
             f"/earnings/{earnings_type}",
-            params={"tickers": _normalize_tickers(tickers)},
+            params={
+                "tickers": _normalize_tickers(tickers),
+                "force_update": force_update,
+            },
         )
 
-    def get_dividends(self, tickers: list[str] | str) -> pl.DataFrame:
+    def get_dividends(
+        self,
+        tickers: list[str] | str,
+        force_update: bool = False,
+    ) -> pl.DataFrame:
         return self._get_frame(
             "/dividends",
-            params={"tickers": _normalize_tickers(tickers)},
+            params={
+                "tickers": _normalize_tickers(tickers),
+                "force_update": force_update,
+            },
         )
 
     def get_risk_free_rate(

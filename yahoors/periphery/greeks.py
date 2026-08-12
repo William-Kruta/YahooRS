@@ -10,7 +10,9 @@ def pdf(x: float) -> float:
 def cdf(x: float) -> float:
     """Standard normal cumulative distribution function (approximation)."""
     t = 1.0 / (1.0 + 0.2316419 * abs(x))
-    poly = t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))))
+    poly = t * (
+        0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429)))
+    )
     approx = 1.0 - pdf(x) * poly
     return approx if x >= 0.0 else 1.0 - approx
 
@@ -43,7 +45,14 @@ def calculate_greeks(
     is_call    = True for call, False for put
     """
     if t <= 0.0 or sigma <= 0.0 or s <= 0.0 or k <= 0.0:
-        return {"delta": None, "gamma": None, "theta": None, "vega": None, "bs_price": None, "prob_profit": None}
+        return {
+            "delta": None,
+            "gamma": None,
+            "theta": None,
+            "vega": None,
+            "bs_price": None,
+            "prob_profit": None,
+        }
 
     d1, d2 = d1_d2(s, k, t, r, sigma)
     discount = math.exp(-r * t)
@@ -59,17 +68,23 @@ def calculate_greeks(
         if breakeven <= 0.0:
             prob_profit = 0.0
         else:
-            d_breakeven = (math.log(s / breakeven) + (r - 0.5 * sigma * sigma) * t) / (sigma * math.sqrt(t))
+            d_breakeven = (math.log(s / breakeven) + (r - 0.5 * sigma * sigma) * t) / (
+                sigma * math.sqrt(t)
+            )
             prob_profit = cdf(d_breakeven)
     else:
         delta = cdf(d1) - 1.0
-        theta = (-(s * pdf(d1) * sigma) / (2.0 * math.sqrt(t)) + r * k * discount * cdf(-d2)) / 365.0
+        theta = (
+            -(s * pdf(d1) * sigma) / (2.0 * math.sqrt(t)) + r * k * discount * cdf(-d2)
+        ) / 365.0
         bs_price = k * discount * cdf(-d2) - s * cdf(-d1)
         breakeven = k - last_price
         if breakeven <= 0.0:
             prob_profit = 0.0
         else:
-            d_breakeven = (math.log(s / breakeven) + (r - 0.5 * sigma * sigma) * t) / (sigma * math.sqrt(t))
+            d_breakeven = (math.log(s / breakeven) + (r - 0.5 * sigma * sigma) * t) / (
+                sigma * math.sqrt(t)
+            )
             prob_profit = cdf(-d_breakeven)
 
     return {
@@ -80,7 +95,6 @@ def calculate_greeks(
         "bs_price": bs_price,
         "prob_profit": prob_profit,
     }
-
 
 
 def implied_volatility(
@@ -145,7 +159,6 @@ def add_greeks_to_df(
     results = {"delta": [], "gamma": [], "theta": [], "vega": [], "bs_price": [], "prob_profit": []}
 
     strikes = df["strike"].to_list()
-    ivs = df["impliedVolatility"].to_list()
     last_prices = df["lastPrice"].to_list()
     bids = df["bid"].to_list()
     asks = df["ask"].to_list()
@@ -168,6 +181,8 @@ def add_greeks_to_df(
             premium = (bid + ask) / 2.0
         elif bid > 0.0:
             premium = bid
+        elif ask > 0.0:
+            premium = ask
         else:
             premium = last_price
 
@@ -179,6 +194,4 @@ def add_greeks_to_df(
         for key in results:
             results[key].append(greeks[key])
 
-    return df.with_columns([
-        pl.Series(name, values) for name, values in results.items()
-    ])
+    return df.with_columns([pl.Series(name, values) for name, values in results.items()])

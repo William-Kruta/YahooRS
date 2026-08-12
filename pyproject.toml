@@ -1,29 +1,34 @@
 [project]
 name = "yahoors"
-version = "0.1.92"
-description = "A python wrapper for Yahoo Finance using rust for the backend."
+version = "0.1.93"
+description = "A Python toolkit for Yahoo Finance data with DuckDB caching and Polars analytics."
+license = "MIT"
 authors = [{ name = "William Kruta", email = "wjkruta@gmail.com" }]
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "build>=1.4.2",
     "duckdb>=1.5.1",
     "fastapi>=0.116.1",
     "httpx>=0.28.1",
     "pandas>=3.0.1",
     "polars>=1.39.3",
     "pyarrow>=23.0.1",
-    "twine>=6.2.0",
     "uvicorn>=0.35.0",
     "yfinance>=1.2.0",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Topic :: Office/Business :: Financial :: Investment",
 ]
 keywords = ["finance", "yahoo", "options", "candles", "duckdb", "polars"]
+[project.optional-dependencies]
+dev = [
+    "build>=1.4.2",
+    "pytest>=8.0",
+    "ruff>=0.11",
+    "twine>=6.2.0",
+]
 [project.scripts]
 yahoors = "yahoors.cli:main"
 yahoors-api = "yahoors.server:run"
@@ -36,3 +41,14 @@ Homepage = "https://github.com/William-Kruta/YahooRS"
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["live: opt-in tests that call Yahoo Finance"]

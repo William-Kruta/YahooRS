@@ -1,10 +1,8 @@
-duckdb
-yfinance
-polars
-pyarrow
-lxml
-
-# Server
-httpx
-fastapi
-uvicorn
+duckdb>=1.5.1
+fastapi>=0.116.1
+httpx>=0.28.1
+pandas>=3.0.1
+polars>=1.39.3
+pyarrow>=23.0.1
+uvicorn>=0.35.0
+yfinance>=1.2.0

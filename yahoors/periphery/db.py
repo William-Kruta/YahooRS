@@ -21,6 +21,15 @@ def _init_tables(db_path: str = None) -> duckdb.DuckDBPyConnection:
             PRIMARY KEY (date, ticker, interval)
         );
 
+        CREATE TABLE IF NOT EXISTS candle_cache_state (
+            ticker          VARCHAR     NOT NULL,
+            interval        VARCHAR     NOT NULL,
+            coverage_start  TIMESTAMPTZ,
+            full_history    BOOLEAN     NOT NULL DEFAULT FALSE,
+            updated_at      TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (ticker, interval)
+        );
+
         CREATE TABLE IF NOT EXISTS dividends (
             date        TIMESTAMP   NOT NULL,
             ticker      VARCHAR     NOT NULL,
@@ -71,10 +80,19 @@ def _init_tables(db_path: str = None) -> duckdb.DuckDBPyConnection:
             date            TIMESTAMP   NOT NULL,
             ticker          VARCHAR     NOT NULL,
             label           VARCHAR     NOT NULL,
-            value           DOUBLE      NOT NULL,
+            value           DOUBLE,
             statement_type  VARCHAR     NOT NULL,
             period          VARCHAR     NOT NULL DEFAULT 'A',
             PRIMARY KEY (date, ticker, label, statement_type, period)
+        );
+
+        CREATE TABLE IF NOT EXISTS statement_cache_state (
+            ticker          VARCHAR     NOT NULL,
+            statement_type  VARCHAR     NOT NULL,
+            period          VARCHAR     NOT NULL,
+            updated_at      TIMESTAMPTZ NOT NULL,
+            row_count       BIGINT      NOT NULL DEFAULT 0,
+            PRIMARY KEY (ticker, statement_type, period)
         );
 
         CREATE TABLE IF NOT EXISTS company_info (
@@ -100,6 +118,7 @@ def _init_tables(db_path: str = None) -> duckdb.DuckDBPyConnection:
             eps_estimate    DOUBLE,
             reported_eps    DOUBLE,
             surprise_pct    DOUBLE,
+            collected_at    TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (earnings_date, ticker)
         );
 
@@ -125,6 +144,7 @@ def _init_tables(db_path: str = None) -> duckdb.DuckDBPyConnection:
             eps_estimate    DOUBLE,
             eps_difference  DOUBLE,
             surprise_pct    DOUBLE,
+            collected_at    TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (quarter, ticker)
         );
 
@@ -132,30 +152,61 @@ def _init_tables(db_path: str = None) -> duckdb.DuckDBPyConnection:
 
     """
     )
+    _migrate_statement_cache(conn)
     conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_candles_ticker_interval ON candles (ticker, interval);
         CREATE INDEX IF NOT EXISTS idx_options_ticker_collected ON options (ticker, collected_at);
         CREATE INDEX IF NOT EXISTS idx_statements_ticker_type ON statements (ticker, statement_type, period);
+        CREATE INDEX IF NOT EXISTS idx_statement_cache_state_updated ON statement_cache_state (updated_at);
         """
     )
-    conn.execute(
-        "ALTER TABLE company_info ADD COLUMN IF NOT EXISTS ceo VARCHAR"
-    )
-    conn.execute(
-        "ALTER TABLE company_info ADD COLUMN IF NOT EXISTS full_time_employees BIGINT"
-    )
-    conn.execute(
-        "ALTER TABLE company_info ADD COLUMN IF NOT EXISTS dynamic_updated_at TIMESTAMPTZ"
-    )
-    conn.execute(
-        "ALTER TABLE options ADD COLUMN IF NOT EXISTS dtr INTEGER"
-    )
-    conn.execute(
-        "ALTER TABLE candles ADD COLUMN IF NOT EXISTS collected_at TIMESTAMPTZ"
-    )
+    conn.execute("ALTER TABLE company_info ADD COLUMN IF NOT EXISTS ceo VARCHAR")
+    conn.execute("ALTER TABLE company_info ADD COLUMN IF NOT EXISTS full_time_employees BIGINT")
+    conn.execute("ALTER TABLE company_info ADD COLUMN IF NOT EXISTS dynamic_updated_at TIMESTAMPTZ")
+    conn.execute("ALTER TABLE options ADD COLUMN IF NOT EXISTS dtr INTEGER")
+    conn.execute("ALTER TABLE candles ADD COLUMN IF NOT EXISTS collected_at TIMESTAMPTZ")
+    conn.execute("ALTER TABLE earnings_dates ADD COLUMN IF NOT EXISTS collected_at TIMESTAMPTZ")
+    conn.execute("ALTER TABLE earnings_history ADD COLUMN IF NOT EXISTS collected_at TIMESTAMPTZ")
     _migrate_earnings_estimates_pk(conn)
     return conn
+
+
+def _migrate_statement_cache(conn):
+    value_is_not_null = conn.execute(
+        """
+        SELECT count(*) FROM duckdb_constraints()
+        WHERE table_name = 'statements'
+          AND constraint_type = 'NOT NULL'
+          AND constraint_column_names = ['value']
+        """
+    ).fetchone()[0]
+    if value_is_not_null:
+        conn.execute("DROP INDEX IF EXISTS idx_statements_ticker_type")
+        conn.execute("ALTER TABLE statements ALTER COLUMN value DROP NOT NULL")
+
+    cache_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info('statement_cache_state')").fetchall()
+    }
+    if "row_count" not in cache_columns:
+        conn.execute(
+            """
+            ALTER TABLE statement_cache_state
+            ADD COLUMN row_count BIGINT
+            """
+        )
+        conn.execute(
+            """
+            UPDATE statement_cache_state AS state
+            SET row_count = (
+                SELECT count(*)
+                FROM statements AS statement
+                WHERE statement.ticker = state.ticker
+                  AND statement.statement_type = state.statement_type
+                  AND statement.period = state.period
+            )
+            """
+        )
 
 
 def _migrate_earnings_estimates_pk(conn):
@@ -202,15 +253,11 @@ def _migrate_earnings_estimates_pk(conn):
         """
     )
     conn.execute("DROP TABLE earnings_estimates")
-    conn.execute(
-        "ALTER TABLE earnings_estimates_migrated RENAME TO earnings_estimates"
-    )
+    conn.execute("ALTER TABLE earnings_estimates_migrated RENAME TO earnings_estimates")
     conn.execute("COMMIT")
 
 
-def insert_data(
-    df: pl.DataFrame, db_cols: list, table_name: str, conn, pk_cols: list = None
-):
+def insert_data(df: pl.DataFrame, db_cols: list, table_name: str, conn, pk_cols: list = None):
     if df.is_empty():
         return
     final_cols = [c for c in db_cols if c in df.columns]
@@ -233,9 +280,7 @@ def insert_data(
         """
         )
     else:
-        conn.execute(
-            f"INSERT INTO {table_name} ({col_names}) SELECT {col_names} FROM df"
-        )
+        conn.execute(f"INSERT INTO {table_name} ({col_names}) SELECT {col_names} FROM df")
 
 
 # def insert_data(df: pl.DataFrame, db_cols: list, table_name: str, conn):

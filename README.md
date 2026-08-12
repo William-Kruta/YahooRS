@@ -7,7 +7,7 @@ YahooRS is a Python-based utility for fetching and managing Yahoo Finance data, 
 - **Historical Price Data (Candles):** Fetch and store historical price data with configurable intervals and periods. Includes automated staleness detection and local caching via `collected_at` timestamps — data is only re-downloaded when genuinely stale, not on every call.
 - **Options Analysis:** Download full option chains with real-time Greeks (Delta, Gamma, Theta, Vega), Black-Scholes pricing, and probability of profit calculations (both BS-derived and historical). Supports filtering by DTE range, bid/ask minimums, option type, and long/short side.
 - **Options Screener:** Ready-to-use strategies including `cash_secured_puts` and a general `options_screener` with yield metrics (premium, ROC, annualized ROC, collateral, expected return).
-- **Earnings Data:** Earnings dates, EPS estimates, and history with automatic staleness handling. Gracefully handles tickers with no earnings data (ETFs, etc.).
+- **Earnings Data:** Earnings dates, EPS estimates, and history with per-dataset staleness handling and explicit force refreshes. Gracefully handles tickers with no earnings data (ETFs, etc.).
 - **Financial Statements:** Retrieve annual and quarterly income statements, balance sheets, and cash flow statements.
 - **Financial Ratios & Margins:** Automated calculation of key financial metrics such as P/E, P/S, P/B, EV/EBITDA, ROE, and various profit margins.
 - **Local Database (DuckDB):** Persists all fetched data locally to minimize redundant API calls and enable fast offline analysis.
@@ -30,6 +30,9 @@ The package installs a `yahoors` command with several subcommands:
 ### Fetch Candle Data
 ```bash
 yahoors get-candles AAPL MSFT --interval 1d --range 1y
+
+# Bypass the cache and refresh the requested range
+yahoors get-candles AAPL MSFT --interval 1d --range 1y --force-update
 ```
 
 ### Options Screener
@@ -40,6 +43,9 @@ yahoors options-screener -s AAPL --min-dte 30 --max-dte 60
 ### Financial Statements
 ```bash
 yahoors statements AAPL --statement-type income --annual --ratios
+
+# Refresh statements and their candle inputs before calculating ratios
+yahoors statements AAPL --statement-type income --annual --ratios --force-update
 ```
 
 ## Library Usage
@@ -53,6 +59,14 @@ candles = Candles()
 
 # Fetch historical data (cached — only downloads when stale)
 df = candles.get_candles(["AAPL", "MSFT"], interval="1d")
+
+# Bypass staleness checks and replace cached OHLCV values
+fresh_df = candles.get_candles(
+    ["AAPL", "MSFT"],
+    interval="1d",
+    period="1y",
+    force_update=True,
+)
 
 # Get the latest closing price without loading full history
 prices = candles.get_last_price(["AAPL", "MSFT"])
@@ -98,7 +112,8 @@ df = cash_secured_puts(
 # Columns include: strike, premium, collateral, roc, annualized_roc,
 #                  prob_profit, hist_prob_profit, expected_return, dtr, ...
 
-# General screener — pass any options DataFrame
+# General screener — pass any options DataFrame. Short calls are modeled as
+# covered calls for collateral and maximum-loss calculations.
 df = options_screener(
     options_df,
     min_dte=0,
@@ -122,6 +137,9 @@ earnings = Earnings()
 # Upcoming and historical earnings dates
 dates_df = earnings.get_earnings_dates(["AAPL", "MSFT"])
 
+# Every earnings getter also supports an explicit refresh
+fresh_dates_df = earnings.get_earnings_dates(["AAPL"], force_update=True)
+
 # EPS estimates
 estimates_df = earnings.get_earnings_estimates(["AAPL"])
 
@@ -134,8 +152,55 @@ history_df = earnings.get_earnings_history(["AAPL"])
 ```python
 from yahoors import Statements
 
-statements = Statements()
-df = statements.get_statements(["AAPL"], statement_type="income", period="A")
+with Statements() as statements:
+    df = statements.get_statement(
+        ["AAPL"],
+        statement="income_statement",
+        period="A",
+        force_update=True,
+    )
+```
+
+Statement column names preserve Yahoo's actual fiscal period-end dates. Missing
+values remain null rather than being converted to zero. Successful statement
+downloads use the normal annual or quarterly cache lifetime; empty responses use
+a one-day negative cache so temporary upstream gaps recover promptly.
+
+## Resource Management
+
+DuckDB-backed classes implement context managers. Use them for short-lived jobs
+so every database connection is closed deterministically:
+
+```python
+from yahoors import Candles, Options, Statements
+
+with Candles() as candles:
+    prices = candles.get_last_price(["AAPL", "MSFT"])
+
+with Options() as options:
+    chain = options.get_options(["AAPL"])
+
+with Statements() as statements:
+    income = statements.get_income_statement("AAPL", period="A")
+```
+
+Long-lived instances can instead call `close()` explicitly. The HTTP server
+serializes access to its shared DuckDB-backed modules and closes them during
+application shutdown.
+
+## Tests
+
+The normal suite is offline:
+
+```bash
+pytest -q
+```
+
+Two optional Yahoo Finance smoke tests validate live candle and statement
+responses:
+
+```bash
+YAHOORS_RUN_LIVE_TESTS=1 pytest -q -m live
 ```
 
 ## Probability of Profit
@@ -145,7 +210,7 @@ YahooRS computes two probability metrics for each contract:
 - **`prob_profit`** — Black-Scholes derived, using the contract's implied volatility and breakeven price.
 - **`hist_prob_profit`** — Historical, derived from the actual distribution of past returns over the contract's DTE window.
 
-For `side="short"`, both are automatically inverted (`1 - p`) so they represent the seller's probability of profit. Contracts where IV cannot be computed (no valid bid/ask/last_price) are returned with `null` probabilities and are excluded from screener results.
+For `side="short"`, both are automatically inverted (`1 - p`) so they represent the seller's probability of profit. Contracts where IV cannot be computed are excluded from cached option snapshots and screener results. Historical return windows use calendar DTE rather than treating DTE as a count of trading sessions.
 
 ## Expected Return
 
@@ -155,7 +220,9 @@ The `expected_return` column in screener output is computed as:
 expected_return = (premium - bs_price) / strike
 ```
 
-This represents the edge over fair value — the portion of premium collected above the Black-Scholes theoretical price, normalized by the strike. Positive values indicate you are selling overpriced implied volatility relative to the model.
+For short contracts, this represents premium collected above Black-Scholes fair value, normalized by strike. Long contracts reverse the calculation to `(bs_price - premium) / strike`, so positive values consistently represent a favorable model edge. Zero-DTE contracts retain non-annualized ROC but return `null` for `annualized_roc`.
+
+Dividend yield uses the sum of all payments in the trailing 365 calendar days, so monthly, quarterly, annual, and irregular payment schedules are handled consistently.
 
 ## License
 

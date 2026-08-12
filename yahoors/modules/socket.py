@@ -37,10 +37,13 @@ class WebSocket:
         self._interval: str | None = None
         self._ingested = False
         self._closed = False
+        self._db_closed = False
         if self.persist:
             self._ensure_csv()
 
     def connect(self, tickers: list[str] | str, interval: str):
+        if self._db_closed:
+            raise RuntimeError("This WebSocket has been closed and cannot reconnect.")
         if isinstance(tickers, str):
             tickers = [tickers]
         self._tickers = clean_tickers(tickers)
@@ -114,12 +117,24 @@ class WebSocket:
         if errors:
             raise errors[0]
 
-    def close(self):
+    def close(self) -> None:
+        if self._db_closed:
+            return
         self._closed = True
         try:
             self.ws.close()
         finally:
-            self._ingest_csv_to_db()
+            try:
+                self._ingest_csv_to_db()
+            finally:
+                self.conn.close()
+                self._db_closed = True
+
+    def __enter__(self) -> "WebSocket":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
     def _ensure_csv(self):
         if not self.persist or self.csv_path is None:
@@ -129,9 +144,7 @@ class WebSocket:
             return
         with self.csv_path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle)
-            writer.writerow(
-                ["date", "ticker", "open", "high", "low", "close", "volume"]
-            )
+            writer.writerow(["date", "ticker", "open", "high", "low", "close", "volume"])
 
     def _on_message(self, message: dict, on_row: Callable[[dict], None] | None = None):
         row = self._normalize_message(message)
@@ -252,10 +265,7 @@ class WebSocket:
             .sort(["ticker", "date"])
             .with_columns(pl.col("date").dt.date().alias("session_date"))
             .with_columns(
-                (
-                    pl.col("volume")
-                    - pl.col("volume").shift(1).over(["ticker", "session_date"])
-                )
+                (pl.col("volume") - pl.col("volume").shift(1).over(["ticker", "session_date"]))
                 .fill_null(0)
                 .clip(lower_bound=0)
                 .alias("trade_volume")
@@ -282,8 +292,6 @@ class WebSocket:
             )
             .filter(pl.col("open").is_not_null())
             .with_columns(pl.lit(interval).alias("interval"))
-            .select(
-                ["date", "ticker", "interval", "open", "high", "low", "close", "volume"]
-            )
+            .select(["date", "ticker", "interval", "open", "high", "low", "close", "volume"])
             .sort(["ticker", "date"])
         )

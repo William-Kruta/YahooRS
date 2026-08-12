@@ -1,3 +1,5 @@
+from contextlib import ExitStack
+
 import polars as pl
 
 from .candles import Candles
@@ -99,7 +101,9 @@ def quality_filter(
             statements_obj.conn.execute(
                 f"SELECT DISTINCT ticker FROM statements WHERE ticker IN ({placeholders}) AND period = ?",
                 tickers + [period],
-            ).pl()["ticker"].to_list()
+            )
+            .pl()["ticker"]
+            .to_list()
         )
         return [t for t in tickers if t in passing or t in no_data]
     except Exception as e:
@@ -119,12 +123,18 @@ def run_screener(
 ) -> pl.DataFrame:
     if not tickers:
         return pl.DataFrame()
-    options_df = options_obj.get_options(tickers, get_latest=True)
+    options_df = options_obj.get_options_by_dte_range(
+        tickers,
+        min_dte=min_dte,
+        max_dte=max_dte,
+    )
     if options_df.is_empty():
         return pl.DataFrame()
     puts = options_df.filter(pl.col("option_type") == "put")
     if verbose:
-        print(f"[screener] {len(tickers)} tickers → {len(options_df)} option rows → {len(puts)} puts")
+        print(
+            f"[screener] {len(tickers)} tickers → {len(options_df)} option rows → {len(puts)} puts"
+        )
     return options_screener(
         puts,
         min_dte=min_dte,
@@ -168,46 +178,50 @@ def scan_for_csps(
     if db_path is None:
         db_path = str(get_db_path())
 
-    candles_obj = Candles(db_path, debug=False)
-    options_obj = Options(db_path)
+    with ExitStack() as stack:
+        candles_obj = stack.enter_context(Candles(db_path, debug=False))
+        options_obj = stack.enter_context(Options(db_path))
 
-    # Stage 1: load universe, merge optional watchlist
-    universe = load_universe(universe_csv, ticker_col)
-    if watchlist:
-        extra = clean_tickers(watchlist)
-        universe = list(dict.fromkeys(universe + extra))
-    if verbose:
-        print(f"[scanner] universe: {len(universe)} tickers")
-
-    # Stage 2: candle prescreen (cheap — uses cached data + technicals)
-    candidates, _stats = prescreen_with_candles(
-        universe,
-        candles_obj,
-        max_collateral=max_collateral,
-        min_bb_width=min_bb_width,
-        max_rsi=max_rsi,
-    )
-    if verbose:
-        print(f"[scanner] after candle prescreen: {len(candidates)} candidates  (bb_width≥{min_bb_width}, rsi≤{max_rsi})")
-
-    # Stage 3: quality filter (optional — requires downloading statements)
-    if apply_quality_filter and candidates:
-        statements_obj = Statements(db_path)
-        candidates = quality_filter(candidates, statements_obj)
+        # Stage 1: load universe, merge optional watchlist
+        universe = load_universe(universe_csv, ticker_col)
+        if watchlist:
+            extra = clean_tickers(watchlist)
+            universe = list(dict.fromkeys(universe + extra))
         if verbose:
-            print(f"[scanner] after quality filter: {len(candidates)} candidates")
+            print(f"[scanner] universe: {len(universe)} tickers")
 
-    # Stage 4: fetch options + screen
-    results = run_screener(
-        candidates,
-        options_obj,
-        min_dte=min_dte,
-        max_dte=max_dte,
-        max_collateral=max_collateral,
-        min_premium=min_premium,
-        min_roc=min_roc,
-        verbose=verbose,
-    )
-    if verbose:
-        print(f"[scanner] final results: {len(results)} contracts")
-    return results
+        # Stage 2: candle prescreen (cheap — uses cached data + technicals)
+        candidates, _stats = prescreen_with_candles(
+            universe,
+            candles_obj,
+            max_collateral=max_collateral,
+            min_bb_width=min_bb_width,
+            max_rsi=max_rsi,
+        )
+        if verbose:
+            print(
+                f"[scanner] after candle prescreen: {len(candidates)} candidates  "
+                f"(bb_width≥{min_bb_width}, rsi≤{max_rsi})"
+            )
+
+        # Stage 3: quality filter (optional — requires downloading statements)
+        if apply_quality_filter and candidates:
+            statements_obj = stack.enter_context(Statements(db_path, candles_obj=candles_obj))
+            candidates = quality_filter(candidates, statements_obj)
+            if verbose:
+                print(f"[scanner] after quality filter: {len(candidates)} candidates")
+
+        # Stage 4: fetch options + screen
+        results = run_screener(
+            candidates,
+            options_obj,
+            min_dte=min_dte,
+            max_dte=max_dte,
+            max_collateral=max_collateral,
+            min_premium=min_premium,
+            min_roc=min_roc,
+            verbose=verbose,
+        )
+        if verbose:
+            print(f"[scanner] final results: {len(results)} contracts")
+        return results

@@ -2,6 +2,8 @@ import yfinance as yf
 import polars as pl
 import pandas as pd
 import datetime as dt
+from bisect import bisect_left
+import logging
 from typing import Literal
 
 from .candles import Candles
@@ -9,6 +11,9 @@ from .earnings import Earnings
 from ..periphery.db import _init_tables, insert_data
 from ..periphery.utils import clean_tickers, list_difference
 from ..periphery.greeks import add_greeks_to_df
+
+
+logger = logging.getLogger(__name__)
 
 
 RENAME = {
@@ -62,6 +67,17 @@ class Options:
         self.candles = Candles(db_path)
         self.earnings = Earnings(db_path)
 
+    def close(self) -> None:
+        self.earnings.close()
+        self.candles.close()
+        self.conn.close()
+
+    def __enter__(self) -> "Options":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
     def _calc_date_deltas(
         self,
         dates: list[str],
@@ -90,76 +106,62 @@ class Options:
         tickers: list,
         min_dte: int = 0,
         max_dte: int = 10,
-        min_bid: int = 0,
-        min_ask: int = 0,
+        min_bid: float = 0,
+        min_ask: float = 0,
         option_type: Literal["call", "put", "*"] = "*",
         side: Literal["long", "short", "*"] = "*",
         rfr_ticker: str = "^TNX",
-    ):
+        force_update: bool = False,
+    ) -> pl.DataFrame:
         if isinstance(tickers, str):
             tickers = [tickers]
-        assert option_type in (
-            "call",
-            "put",
-            "*",
-        ), f"option_type must be 'call', 'put', or '*', got {option_type!r}"
-        assert side in (
-            "long",
-            "short",
-            "*",
-        ), f"side must be 'long', 'short', or '*', got {side!r}"
-        # risk_free_rate = self.candles.get_last_price(["^TNX"])["^TNX"] / 100.0
-        data = []
-        _tickers = [*tickers, rfr_ticker]
-        prices = self.candles.get_last_price(tickers=_tickers)
-        risk_free_rate = prices[rfr_ticker] / 100.0
-        for t in tickers:
-            obj = yf.Ticker(t)
-            dates = obj.options
-            dates = self._calc_date_deltas(
-                dates=dates, min_dte=min_dte, max_dte=max_dte
-            )
-            stock_price = prices[t]
-            for k, v in dates.items():
-                chain = obj.option_chain(k)
-                if option_type.lower() in ("call", "*"):
-                    calls = self._iterate_chain_type(
-                        chain.calls, "call", t, stock_price
-                    )
-                    data.append(calls)
-                if option_type.lower() in ("put", "*"):
-                    puts = self._iterate_chain_type(chain.puts, "put", t, stock_price)
-                    data.append(puts)
+        tickers = clean_tickers(tickers)
+        if min_dte < 0:
+            raise ValueError("min_dte must be non-negative")
+        if max_dte < min_dte:
+            raise ValueError("max_dte must be greater than or equal to min_dte")
+        if option_type not in ("call", "put", "*"):
+            raise ValueError(f"option_type must be 'call', 'put', or '*', got {option_type!r}")
+        if side not in ("long", "short", "*"):
+            raise ValueError(f"side must be 'long', 'short', or '*', got {side!r}")
 
-        if not data:
+        frames: list[pl.DataFrame] = []
+        for ticker in tickers:
+            try:
+                available = yf.Ticker(ticker).options
+            except Exception as exc:
+                logger.warning("Unable to list option expirations for %s: %s", ticker, exc)
+                continue
+
+            expirations = list(
+                self._calc_date_deltas(
+                    dates=available,
+                    min_dte=min_dte,
+                    max_dte=max_dte,
+                )
+            )
+            if not expirations:
+                continue
+            frame = self.get_options(
+                [ticker],
+                get_latest=True,
+                expirations=expirations,
+                force_update=force_update,
+                rfr_ticker=rfr_ticker,
+            )
+            if not frame.is_empty():
+                frames.append(frame)
+
+        if not frames:
             return pl.DataFrame()
-        df = pl.from_pandas(pd.concat(data))
-        df = df.with_columns(
-            pl.lit(dt.datetime.now(dt.timezone.utc)).alias("collected_at")
+
+        df = pl.concat(frames, how="diagonal_relaxed").filter(
+            pl.col("dte").is_between(min_dte, max_dte),
+            pl.col("bid") >= min_bid,
+            pl.col("ask") >= min_ask,
         )
-        if min_bid >= 0:
-            df = df.filter(pl.col("bid") >= min_bid)
-        if min_ask >= 0:
-            df = df.filter(pl.col("ask") >= min_ask)
-        df = df.with_columns(
-            pl.col("contractSymbol")
-            .map_elements(parse_expiration, return_dtype=pl.Utf8)
-            .str.to_date("%Y-%m-%d")
-            .alias("expiration"),
-        ).with_columns(
-            (pl.col("expiration") - pl.lit(dt.date.today()))
-            .dt.total_days()
-            .alias("dte")
-        )
-        df = add_greeks_to_df(df, risk_free_rate=risk_free_rate)
-        df = self.calculate_historical_probs(df, self.candles.get_candles(tickers))
-        df = self._add_days_to_report(df, tickers)
-        df = df.rename(mapping=RENAME).select(SELECTION)
-        # return pl.from_pandas()
-        df = df.with_columns(
-            pl.col("volume", "open_interest").fill_null(0),
-            pl.col("bid", "ask", "last_price", "implied_volatility").fill_null(0.0),
-        )
+        if option_type != "*":
+            df = df.filter(pl.col("option_type") == option_type)
         if side == "short":
             df = df.with_columns(
                 (1 - pl.col("prob_profit")).alias("prob_profit"),
@@ -179,20 +181,26 @@ class Options:
         self,
         tickers: list[str],
         get_latest: bool = False,
-        expirations: list[str] = [],
+        expirations: list[str] | None = None,
         stale_threshold: dt.timedelta = dt.timedelta(days=1),
         force_update: bool = False,
         min_date: dt.datetime | dt.date | str | None = None,
+        rfr_ticker: str = "^TNX",
     ) -> pl.DataFrame:
         if isinstance(tickers, str):
             tickers = [tickers]
         tickers = clean_tickers(tickers)
+        expirations = expirations or []
+        requested_expirations = {str(expiration) for expiration in expirations}
         min_date_dt = self._normalize_min_date(min_date)
         df = self._read_options(tickers, get_latest=get_latest, min_date=min_date_dt)
 
         if df.is_empty() or force_update:
             fresh = self._download_options(
-                tickers, expirations=expirations, get_latest=get_latest
+                tickers,
+                expirations=expirations,
+                get_latest=get_latest,
+                rfr_ticker=rfr_ticker,
             )
             self._insert_options(fresh)
         else:
@@ -206,36 +214,64 @@ class Options:
             cached_tickers = []
             for ticker, collected_at in latest_per_ticker:
                 if isinstance(collected_at, str):
-                    collected_at = dt.datetime.strptime(
-                        collected_at, "%Y-%m-%d %H:%M:%S.%f%z"
-                    )
+                    collected_at = dt.datetime.strptime(collected_at, "%Y-%m-%d %H:%M:%S.%f%z")
                 if (dt.datetime.now(dt.timezone.utc) - collected_at) > stale_threshold:
                     stale_tickers.append(ticker)
                 else:
                     cached_tickers.append(ticker)
 
-            missing_tickers = list_difference(cached_tickers + stale_tickers, tickers)
-            if stale_tickers:
+            known_tickers = cached_tickers + stale_tickers
+            missing_tickers = list_difference(known_tickers, tickers)
+            coverage_missing_tickers = []
+            if requested_expirations:
+                cached_expirations = {
+                    ticker: {
+                        str(value)
+                        for value in df.filter(pl.col("ticker") == ticker)["expiration"].unique()
+                    }
+                    for ticker in known_tickers
+                }
+                coverage_missing_tickers = [
+                    ticker
+                    for ticker in tickers
+                    if not requested_expirations.issubset(cached_expirations.get(ticker, set()))
+                ]
+
+            refresh_tickers = list(
+                dict.fromkeys(stale_tickers + missing_tickers + coverage_missing_tickers)
+            )
+            if refresh_tickers:
                 fresh = self._download_options(
-                    stale_tickers, expirations=expirations, get_latest=get_latest
+                    refresh_tickers,
+                    expirations=expirations,
+                    get_latest=get_latest,
+                    rfr_ticker=rfr_ticker,
                 )
                 self._insert_options(fresh)
 
-            if missing_tickers:
-                fresh = self._download_options(
-                    missing_tickers, expirations=expirations, get_latest=get_latest
-                )
-                self._insert_options(fresh)
-
-        return self._read_options(tickers, get_latest=get_latest, min_date=min_date_dt)
+        result = self._read_options(
+            tickers,
+            get_latest=get_latest,
+            min_date=min_date_dt,
+        )
+        if requested_expirations and not result.is_empty():
+            result = result.filter(
+                pl.col("expiration").cast(pl.String).is_in(sorted(requested_expirations))
+            )
+        return result
 
     def _download_options(
-        self, tickers: list[str], expirations: list[str] = [], get_latest: bool = True
+        self,
+        tickers: list[str],
+        expirations: list[str] | None = None,
+        get_latest: bool = True,
+        rfr_ticker: str = "^TNX",
     ) -> pl.DataFrame:
         if isinstance(tickers, str):
             tickers = [tickers]
+        expirations = expirations or []
 
-        risk_free_rate = self.candles.get_last_price(["^TNX"])["^TNX"] / 100.0
+        risk_free_rate = self.candles.get_last_price([rfr_ticker])[rfr_ticker] / 100.0
         prices = self.candles.get_last_price(tickers)
         data = []
 
@@ -260,25 +296,28 @@ class Options:
                         puts["stock_price"] = stock_price
                         data.append(calls)
                         data.append(puts)
-                    except ValueError:
+                    except ValueError as exc:
+                        logger.warning(
+                            "Unable to download %s option chain for %s: %s",
+                            exp,
+                            t,
+                            exc,
+                        )
                         continue
-            except Exception:
+            except Exception as exc:
+                logger.warning("Unable to download options for %s: %s", t, exc)
                 continue
         if not data:
             return pl.DataFrame()
         df = pl.from_pandas(pd.concat(data))
-        df = df.with_columns(
-            pl.lit(dt.datetime.now(dt.timezone.utc)).alias("collected_at")
-        )
+        df = df.with_columns(pl.lit(dt.datetime.now(dt.timezone.utc)).alias("collected_at"))
         df = df.with_columns(
             pl.col("contractSymbol")
             .map_elements(parse_expiration, return_dtype=pl.Utf8)
             .str.to_date("%Y-%m-%d")
             .alias("expiration"),
         ).with_columns(
-            (pl.col("expiration") - pl.lit(dt.date.today()))
-            .dt.total_days()
-            .alias("dte")
+            (pl.col("expiration") - pl.lit(dt.date.today())).dt.total_days().alias("dte")
         )
         df = add_greeks_to_df(df, risk_free_rate=risk_free_rate)
         df = self.calculate_historical_probs(df, self.candles.get_candles(tickers))
@@ -302,15 +341,17 @@ class Options:
         options_df requires: ticker, dte, strike, option_type, bid, ask, last_price, stock_price
         candles_df requires: ticker, date, close (sorted by date)
         """
-        # Pre-extract closing prices per ticker
-        ticker_data: dict[str, list[float]] = {}
+        # Pre-extract trading dates and closing prices per ticker. DTE is measured
+        # in calendar days, so historical windows must not use a raw row offset
+        # (which would incorrectly interpret 30 DTE as 30 trading sessions).
+        ticker_data: dict[str, tuple[list[dt.date], list[float]]] = {}
         for ticker in candles_df["ticker"].unique().to_list():
-            closes = (
-                candles_df.filter(pl.col("ticker") == ticker)
-                .sort("date")["close"]
-                .to_list()
-            )
-            ticker_data[ticker] = closes
+            ticker_candles = candles_df.filter(pl.col("ticker") == ticker).sort("date")
+            dates = [
+                value.date() if isinstance(value, dt.datetime) else value
+                for value in ticker_candles["date"].to_list()
+            ]
+            ticker_data[ticker] = (dates, ticker_candles["close"].to_list())
 
         # Cache: (ticker, dte) -> list of historical returns
         dist_cache: dict[tuple[str, int], list[float]] = {}
@@ -349,21 +390,22 @@ class Options:
 
             if dte <= 0 or current_price <= 0.0:
                 is_itm = (
-                    (current_price >= strike)
-                    if opt_type == "call"
-                    else (current_price <= strike)
+                    (current_price >= strike) if opt_type == "call" else (current_price <= strike)
                 )
                 hist_probs.append(1.0 if is_itm else 0.0)
                 continue
 
             key = (ticker, dte)
             if key not in dist_cache:
-                closes = ticker_data.get(ticker)
-                if closes and len(closes) > dte:
-                    returns = [
-                        (closes[t] / closes[t - dte]) - 1.0
-                        for t in range(dte, len(closes))
-                    ]
+                history = ticker_data.get(ticker)
+                if history:
+                    dates, closes = history
+                    returns = []
+                    for start_idx, start_date in enumerate(dates):
+                        target_date = start_date + dt.timedelta(days=dte)
+                        end_idx = bisect_left(dates, target_date, lo=start_idx + 1)
+                        if end_idx < len(dates) and closes[start_idx]:
+                            returns.append((closes[end_idx] / closes[start_idx]) - 1.0)
                     dist_cache[key] = returns
 
             returns = dist_cache.get(key)
@@ -405,9 +447,7 @@ class Options:
                 params,
             ).pl()
         else:
-            return self.conn.execute(
-                f"SELECT * FROM options {where_clause}", params
-            ).pl()
+            return self.conn.execute(f"SELECT * FROM options {where_clause}", params).pl()
 
     @staticmethod
     def _normalize_min_date(
@@ -430,9 +470,7 @@ class Options:
                 if parsed.tzinfo is None
                 else parsed.astimezone(dt.timezone.utc)
             )
-        raise TypeError(
-            "min_date must be None, datetime, date, or ISO-8601 datetime string."
-        )
+        raise TypeError("min_date must be None, datetime, date, or ISO-8601 datetime string.")
 
     def _insert_options(self, df: pl.DataFrame):
         if df.is_empty():
@@ -477,9 +515,7 @@ class Options:
             pk_cols=["contract_symbol", "collected_at"],
         )
 
-    def _add_days_to_report(
-        self, options_df: pl.DataFrame, tickers: list[str]
-    ) -> pl.DataFrame:
+    def _add_days_to_report(self, options_df: pl.DataFrame, tickers: list[str]) -> pl.DataFrame:
         earnings_df = self.earnings.get_earnings_dates(tickers)
         if earnings_df.is_empty():
             return options_df.with_columns(pl.lit(None).cast(pl.Int64).alias("dtr"))

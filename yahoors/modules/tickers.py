@@ -1,24 +1,37 @@
 import yfinance as yf
-from typing import Literal
-import pandas as pd
 import polars as pl
 import datetime as dt
 import duckdb
 from .candles import Candles
 from .statements import Statements
-from ..periphery.utils import list_difference, clean_tickers
-from ..periphery.db import _init_tables, insert_data
+from ..periphery.utils import clean_tickers
+from ..periphery.db import _init_tables
 
 COMPANY_INFO_DYNAMIC_STALE_THRESHOLD = dt.timedelta(days=90)
 
 
 class Ticker:
     def __init__(self, ticker: str, db_path: str = None):
-        self.ticker = ticker
+        normalized = clean_tickers([ticker])
+        if not normalized:
+            raise ValueError("ticker must contain a symbol")
+        self.ticker = normalized[0]
         self.conn = _init_tables(db_path)
         self.table_name = "company_info"
-        self._statements_obj = Statements(db_path=db_path)
+        self._candles_obj = Candles(db_path=db_path)
+        self._statements_obj = Statements(db_path=db_path, candles_obj=self._candles_obj)
         self._cache: dict[str, pl.DataFrame] = {}
+
+    def close(self) -> None:
+        self._statements_obj.close()
+        self._candles_obj.close()
+        self.conn.close()
+
+    def __enter__(self) -> "Ticker":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
     def _get_cached(self, key: str, fetcher) -> pl.DataFrame:
         if key not in self._cache:
@@ -95,7 +108,13 @@ class Ticker:
     @property
     def info(self) -> pl.DataFrame:
         return self._get_cached(
-            "info", lambda: _get_info(self.ticker, self.table_name, self.conn)
+            "info",
+            lambda: _get_info(
+                self.ticker,
+                self.table_name,
+                self.conn,
+                candle_obj=self._candles_obj,
+            ),
         )
 
     @property
@@ -111,9 +130,7 @@ class Ticker:
         self._cache.pop("info", None)
 
     def update_ceo(self, ceo: str | None):
-        _update_company_info_fields(
-            self.ticker, {"ceo": ceo}, self.table_name, self.conn
-        )
+        _update_company_info_fields(self.ticker, {"ceo": ceo}, self.table_name, self.conn)
         self._cache.pop("info", None)
 
     def update_full_time_employees(self, full_time_employees: int | None):
@@ -138,13 +155,19 @@ class Ticker:
             refresh_ceo=refresh_ceo,
             refresh_full_time_employees=refresh_full_time_employees,
             refresh_trading_status=refresh_trading_status,
+            candle_obj=self._candles_obj,
         )
         self._cache.pop("info", None)
         self._cache.pop("trading_status", None)
         return _read_ticker_info(self.ticker, self.table_name, self.conn)
 
     def force_update(self) -> pl.DataFrame:
-        _force_update_company_info(self.ticker, self.table_name, self.conn)
+        _force_update_company_info(
+            self.ticker,
+            self.table_name,
+            self.conn,
+            candle_obj=self._candles_obj,
+        )
         self._cache.pop("info", None)
         self._cache.pop("trading_status", None)
         return _read_ticker_info(self.ticker, self.table_name, self.conn)
@@ -277,10 +300,22 @@ class BatchTickers:
     def __init__(self, db_path: str = None, candle_obj: Candles = None):
         self.conn = _init_tables(db_path)
         self.table_name = "company_info"
+        self._owns_candles = candle_obj is None
         if candle_obj is None:
             self.candles = Candles(db_path)
         else:
             self.candles = candle_obj
+
+    def close(self) -> None:
+        if self._owns_candles:
+            self.candles.close()
+        self.conn.close()
+
+    def __enter__(self) -> "BatchTickers":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
     def read_from_csv(
         self,
@@ -320,9 +355,7 @@ class BatchTickers:
     def is_ticker_valid(self, symbol: str, yf_obj: yf.Ticker = None):
         obj = yf_obj or yf.Ticker(symbol)
         try:
-            hist = obj.history(
-                period="1d"
-            )  # was using 'ticker' which is the yf_obj parameter
+            hist = obj.history(period="1d")  # was using 'ticker' which is the yf_obj parameter
             if hist.empty:
                 return False
             return "symbol" in obj.history_metadata
@@ -354,12 +387,17 @@ class BatchTickers:
         return _read_ticker_info(tickers, self.table_name, self.conn)
 
 
-def _get_info(ticker: str, table_name: str, conn: duckdb.DuckDBPyConnection):
+def _get_info(
+    ticker: str,
+    table_name: str,
+    conn: duckdb.DuckDBPyConnection,
+    candle_obj: Candles | None = None,
+):
     if isinstance(ticker, str):
         ticker = [ticker]
     df = _read_ticker_info(ticker, table_name, conn)
     if df.is_empty():
-        df = _download_ticker_info(ticker)
+        df = _download_ticker_info(ticker, candle_obj=candle_obj)
         _insert_ticker_info(df, table_name, conn)
         return _read_ticker_info(ticker, table_name, conn)
 
@@ -370,21 +408,24 @@ def _get_info(ticker: str, table_name: str, conn: duckdb.DuckDBPyConnection):
         threshold=COMPANY_INFO_DYNAMIC_STALE_THRESHOLD,
     )
     if stale_tickers:
-        _refresh_dynamic_company_info_batch(stale_tickers, table_name, conn)
+        _refresh_dynamic_company_info_batch(stale_tickers, table_name, conn, candle_obj=candle_obj)
         return _read_ticker_info(ticker, table_name, conn)
     return df
 
 
-def _download_ticker_info(
-    tickers: list[str], candle_obj: Candles | None = None
-):
+def _download_ticker_info(tickers: list[str], candle_obj: Candles | None = None):
     if isinstance(tickers, str):
         tickers = [tickers]
 
+    owns_candles = candle_obj is None
     candles = candle_obj or Candles()
-    # Batch fetch first prices and candles upfront
-    first_date = candles.get_first_price(tickers, select_col="date", alias="value")
-    last_date = candles.get_last_price(tickers, select_col="date", alias="value")
+    try:
+        # Batch fetch first prices and candles upfront
+        first_date = candles.get_first_price(tickers, select_col="date", alias="value")
+        last_date = candles.get_last_price(tickers, select_col="date", alias="value")
+    finally:
+        if owns_candles:
+            candles.close()
     data = []
     now = dt.datetime.now()
     for t in tickers:
@@ -437,14 +478,10 @@ def _read_ticker_info(
 ) -> pl.DataFrame:
     if isinstance(ticker, str):
         ticker = [ticker]
-    return conn.execute(
-        f"SELECT * FROM {table_name} WHERE symbol = ANY($1)", [ticker]
-    ).pl()
+    return conn.execute(f"SELECT * FROM {table_name} WHERE symbol = ANY($1)", [ticker]).pl()
 
 
-def _insert_ticker_info(
-    df: pl.DataFrame, table_name: str, conn: duckdb.DuckDBPyConnection
-):
+def _insert_ticker_info(df: pl.DataFrame, table_name: str, conn: duckdb.DuckDBPyConnection):
     if df.is_empty():
         return
 
@@ -466,9 +503,7 @@ def _insert_ticker_info(
     ]
     final_cols = [c for c in db_cols if c in df.columns]
     col_names = ", ".join(final_cols)
-    update_set = ", ".join(
-        [f"{c} = EXCLUDED.{c}" for c in final_cols if c != "symbol"]
-    )
+    update_set = ", ".join([f"{c} = EXCLUDED.{c}" for c in final_cols if c != "symbol"])
     conn.execute(
         f"""
         INSERT INTO {table_name} ({col_names})
@@ -509,9 +544,7 @@ def _update_trading_status(
     ticker: list[str], is_active: bool, table_name: str, conn: duckdb.DuckDBPyConnection
 ) -> None:
     """Update the trading status for a given ticker."""
-    _update_company_info_fields(
-        ticker, {"trading_status": is_active}, table_name, conn
-    )
+    _update_company_info_fields(ticker, {"trading_status": is_active}, table_name, conn)
 
 
 def _update_company_info_fields(
@@ -574,8 +607,9 @@ def _refresh_dynamic_company_info(
     refresh_ceo: bool = True,
     refresh_full_time_employees: bool = True,
     refresh_trading_status: bool = True,
+    candle_obj: Candles | None = None,
 ) -> None:
-    fresh = _download_ticker_info([ticker])
+    fresh = _download_ticker_info([ticker], candle_obj=candle_obj)
     if fresh.is_empty():
         return
 
@@ -629,9 +663,7 @@ def _force_update_company_info(
     _insert_ticker_info(fresh, table_name, conn)
 
 
-def _delete_info(
-    ticker: list[str], table_name: str, conn: duckdb.DuckDBPyConnection
-) -> None:
+def _delete_info(ticker: list[str], table_name: str, conn: duckdb.DuckDBPyConnection) -> None:
     """Delete the info for a given ticker."""
     if isinstance(ticker, str):
         ticker = [ticker]

@@ -4,20 +4,37 @@ import polars as pl
 import pandas as pd
 
 from .candles import Candles
-from ..periphery.db import _init_tables, insert_data
-from ..periphery.utils import clean_tickers, list_difference
+from ..periphery.db import _init_tables
+from ..periphery.utils import clean_tickers
+
+
+EMPTY_STATEMENT_STALE_THRESHOLD = dt.timedelta(days=1)
 
 
 class Statements:
     def __init__(self, db_path: str = None, candles_obj: Candles = None):
         self.conn = _init_tables(db_path)
+        self._owns_candles = candles_obj is None
         if candles_obj is None:
             self.candles = Candles(db_path=db_path)
         else:
             self.candles = candles_obj
         self.table_name = "statements"
 
-    def get_income_statement(self, tickers: list, period: str) -> pl.DataFrame:
+    def close(self) -> None:
+        if self._owns_candles:
+            self.candles.close()
+        self.conn.close()
+
+    def __enter__(self) -> "Statements":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def get_income_statement(
+        self, tickers: list, period: str, force_update: bool = False
+    ) -> pl.DataFrame:
         """
         tickers: list, List of tickers to search. Will be converted to a list if single string is passed.
         period: str, Period of financial statements. 'A' for annual and 'Q' for quarterly.
@@ -27,11 +44,14 @@ class Statements:
         if isinstance(tickers, str):
             tickers = [tickers]
         df = self.get_statement(
-            tickers, statement="income_statement", period=period.upper()
+            tickers,
+            statement="income_statement",
+            period=period.upper(),
+            force_update=force_update,
         )
         return df
 
-    def get_balance_sheet(self, tickers: list, period: str):
+    def get_balance_sheet(self, tickers: list, period: str, force_update: bool = False):
         """
         tickers: list, List of tickers to search. Will be converted to a list if single string is passed.
         period: str, Period of financial statements. 'A' for annual and 'Q' for quarterly.
@@ -41,11 +61,14 @@ class Statements:
         if isinstance(tickers, str):
             tickers = [tickers]
         df = self.get_statement(
-            tickers, statement="balance_sheet", period=period.upper()
+            tickers,
+            statement="balance_sheet",
+            period=period.upper(),
+            force_update=force_update,
         )
         return df
 
-    def get_cash_flow(self, tickers: list, period: str):
+    def get_cash_flow(self, tickers: list, period: str, force_update: bool = False):
         """
         tickers: list, List of tickers to search. Will be converted to a list if single string is passed.
         period: str, Period of financial statements. 'A' for annual and 'Q' for quarterly.
@@ -54,11 +77,21 @@ class Statements:
         """
         if isinstance(tickers, str):
             tickers = [tickers]
-        df = self.get_statement(tickers, statement="cash_flow", period=period.upper())
+        df = self.get_statement(
+            tickers,
+            statement="cash_flow",
+            period=period.upper(),
+            force_update=force_update,
+        )
         return df
 
     def get_statement(
-        self, tickers: list[str], statement: str, period: str = "A"
+        self,
+        tickers: list[str],
+        statement: str,
+        period: str = "A",
+        force_update: bool = False,
+        stale_threshold: dt.timedelta | None = None,
     ) -> pl.DataFrame:
         """
         tickers: list, List of tickers to search. Will be converted to a list if single string is passed.
@@ -70,76 +103,38 @@ class Statements:
         if isinstance(tickers, str):
             tickers = [tickers]
         tickers = clean_tickers(tickers)
-        df = self._read_statements(tickers, statement=statement, period=period)
+        period = period.upper()
+        valid_statements = {"balance_sheet", "cash_flow", "income_statement"}
+        if statement not in valid_statements:
+            raise ValueError(f"statement must be one of {sorted(valid_statements)}")
+        if period not in {"A", "Q"}:
+            raise ValueError("period must be 'A' or 'Q'")
+        if not tickers:
+            return pl.DataFrame(schema={"ticker": pl.Utf8, "label": pl.Utf8})
 
+        if stale_threshold is None:
+            stale_threshold = dt.timedelta(days=90) if period == "Q" else dt.timedelta(days=365)
+        refresh_tickers = (
+            tickers
+            if force_update
+            else self._tickers_needing_refresh(
+                tickers,
+                statement,
+                period,
+                stale_threshold,
+                EMPTY_STATEMENT_STALE_THRESHOLD,
+            )
+        )
+        for ticker in refresh_tickers:
+            fresh = self._download_statements(ticker, statement, period)
+            self._cache_statement_download(fresh, ticker, statement, period)
+
+        df = self._read_statements(tickers, statement=statement, period=period)
         if df.is_empty():
-            for ticker in tickers:
-                fresh = self._download_statements(ticker, statement, period)
-                self._insert_statements(fresh)
-        else:
-            db_tickers = df["ticker"].unique().to_list()
-            missing_tickers = list_difference(db_tickers, tickers)
+            return pl.DataFrame(schema={"ticker": pl.Utf8, "label": pl.Utf8})
 
-            # Check staleness per ticker based on most recent date
-            latest_per_ticker = (
-                df.group_by("ticker")
-                .agg(pl.col("date").max().alias("date"))
-                .iter_rows()
-            )
-            stale_threshold = (
-                dt.timedelta(days=90) if period == "Q" else dt.timedelta(days=365)
-            )
-            for ticker, latest_date in latest_per_ticker:
-                if isinstance(latest_date, str):
-                    latest_date = dt.datetime.fromisoformat(latest_date)
-                if (dt.datetime.now() - latest_date) > stale_threshold:
-                    fresh = self._download_statements(ticker, statement, period)
-                    self._insert_statements(fresh)
-
-            if missing_tickers:
-                for ticker in missing_tickers:
-                    fresh = self._download_statements(ticker, statement, period)
-                    self._insert_statements(fresh)
-
-        df = self._read_statements(tickers, statement=statement, period=period)
-
-        def quarter_end(d):
-            q = (d.month - 1) // 3 + 1
-            end_month = q * 3
-            last_day = {3: 31, 6: 30, 9: 30, 12: 31}[end_month]
-            return f"{d.year}-{end_month:02d}-{last_day:02d}"
-
-        if period.upper() == "A":
-            try:
-                df = df.with_columns(
-                    pl.col("date")
-                    .str.to_date("%Y-%m-%d %H:%M:%S")
-                    .dt.year()
-                    .alias("year")
-                )
-            except pl.exceptions.SchemaError:
-                df = df.with_columns(pl.col("date").dt.year().alias("year"))
-            df = df.with_columns(
-                (pl.col("year").cast(pl.Utf8) + "-12-31").alias("year")
-            )
-            pivoted = df.pivot(on="year", index=["ticker", "label"], values="value")
-        elif period.upper() == "Q":
-            try:
-                df = df.with_columns(
-                    pl.col("date")
-                    .str.to_datetime("%Y-%m-%d %H:%M:%S")
-                    .map_elements(quarter_end, return_dtype=pl.Utf8)
-                    .alias("quarter")
-                )
-            except pl.exceptions.SchemaError:
-                df = df.with_columns(
-                    pl.col("date")
-                    .map_elements(quarter_end, return_dtype=pl.Utf8)
-                    .alias("quarter")
-                )
-            pivoted = df.pivot(on="quarter", index=["ticker", "label"], values="value")
-        else:
-            pivoted = df.pivot(on="date", index=["ticker", "label"], values="value")
+        df = df.with_columns(pl.col("date").dt.strftime("%Y-%m-%d").alias("fiscal_date"))
+        pivoted = df.pivot(on="fiscal_date", index=["ticker", "label"], values="value")
         fixed_cols = ["ticker", "label"]
         date_cols = [c for c in pivoted.columns if c not in fixed_cols]
         pivoted = pivoted.select(fixed_cols + sorted(date_cols))
@@ -166,24 +161,17 @@ class Statements:
             melted["ticker"] = ticker
             melted["statement_type"] = statement
             melted["period"] = period
-            melted = melted[
-                ["date", "ticker", "label", "value", "statement_type", "period"]
-            ]
+            melted = melted[["date", "ticker", "label", "value", "statement_type", "period"]]
             data.append(melted)
-        # value is NOT NULL in the schema; yfinance leaves gaps as NaN
-        return pl.from_pandas(pd.concat(data)).with_columns(
-            pl.col("value").fill_null(0)
-        )
+        # Missing statement values are unknown, not zero. Preserve them so
+        # downstream ratios do not turn absent Yahoo data into real balances.
+        return pl.from_pandas(pd.concat(data), nan_to_null=True)
 
-    def _read_statements(
-        self, tickers: list[str], statement: str, period: str
-    ) -> pl.DataFrame:
+    def _read_statements(self, tickers: list[str], statement: str, period: str) -> pl.DataFrame:
         placeholders = ", ".join(["?"] * len(tickers))
         query = f"SELECT * FROM {self.table_name} WHERE ticker IN ({placeholders}) AND statement_type = ? AND period = ?"
         params = [*tickers, statement, period]
-        return pl.read_database(
-            query, self.conn, execute_options={"parameters": params}
-        )
+        return pl.read_database(query, self.conn, execute_options={"parameters": params})
 
     def _insert_statements(self, df: pl.DataFrame):
         if df.is_empty():
@@ -196,15 +184,81 @@ class Statements:
             "statement_type",
             "period",
         ]
-        insert_data(
-            df,
-            db_cols=db_cols,
-            table_name=self.table_name,
-            conn=self.conn,
-            pk_cols=["date", "ticker", "label", "statement_type", "period"],
+        df = df.select(db_cols).unique(
+            subset=["date", "ticker", "label", "statement_type", "period"],
+            keep="last",
+        )
+        self.conn.execute(
+            f"""
+            INSERT INTO {self.table_name} ({", ".join(db_cols)})
+            SELECT {", ".join(db_cols)} FROM df
+            ON CONFLICT (date, ticker, label, statement_type, period)
+            DO UPDATE SET value = EXCLUDED.value
+            """
         )
 
-    def get_margins(self, tickers: list[str], period: str) -> pl.DataFrame:
+    def _tickers_needing_refresh(
+        self,
+        tickers: list[str],
+        statement: str,
+        period: str,
+        stale_threshold: dt.timedelta,
+        empty_stale_threshold: dt.timedelta,
+    ) -> list[str]:
+        placeholders = ", ".join(["?"] * len(tickers))
+        rows = self.conn.execute(
+            f"""
+            SELECT ticker, updated_at, COALESCE(row_count, 0)
+            FROM statement_cache_state
+            WHERE ticker IN ({placeholders})
+              AND statement_type = ?
+              AND period = ?
+            """,
+            [*tickers, statement, period],
+        ).fetchall()
+        cache_state = {ticker: (updated_at, row_count) for ticker, updated_at, row_count in rows}
+        now = dt.datetime.now(dt.timezone.utc)
+        stale_tickers = []
+        for ticker in tickers:
+            if ticker not in cache_state:
+                stale_tickers.append(ticker)
+                continue
+            updated_at, row_count = cache_state[ticker]
+            threshold = stale_threshold if row_count > 0 else empty_stale_threshold
+            if updated_at < now - threshold:
+                stale_tickers.append(ticker)
+        return stale_tickers
+
+    def _cache_statement_download(
+        self,
+        df: pl.DataFrame,
+        ticker: str,
+        statement: str,
+        period: str,
+    ) -> None:
+        self.conn.execute("BEGIN TRANSACTION")
+        try:
+            self._insert_statements(df)
+            self.conn.execute(
+                """
+                INSERT INTO statement_cache_state
+                    (ticker, statement_type, period, updated_at, row_count)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?)
+                ON CONFLICT (ticker, statement_type, period)
+                DO UPDATE SET
+                    updated_at = EXCLUDED.updated_at,
+                    row_count = EXCLUDED.row_count
+                """,
+                [ticker, statement, period, df.height],
+            )
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    def get_margins(
+        self, tickers: list[str], period: str, force_update: bool = False
+    ) -> pl.DataFrame:
         """
         Calculate margins from a pivoted income statement DataFrame.
         Returns long format: ticker, date, margin_name, value
@@ -212,7 +266,10 @@ class Statements:
         # Get date columns (everything except ticker and label)
 
         df = self.get_statement(
-            tickers=tickers, statement="income_statement", period=period
+            tickers=tickers,
+            statement="income_statement",
+            period=period,
+            force_update=force_update,
         )
         date_cols = [c for c in df.columns if c not in ("ticker", "label")]
 
@@ -261,31 +318,36 @@ class Statements:
         balance_sheet_df: pl.DataFrame = None,
         candles_df: pl.DataFrame = None,
         period: str = "A",
+        force_update: bool = False,
     ) -> pl.DataFrame:
         if isinstance(tickers, str):
             tickers = [tickers]
         if income_df is None:
-            income_df = self.get_statement(tickers, "income_statement", period=period)
+            income_df = self.get_statement(
+                tickers,
+                "income_statement",
+                period=period,
+                force_update=force_update,
+            )
         if balance_sheet_df is None:
             balance_sheet_df = self.get_statement(
-                tickers, "balance_sheet", period=period
+                tickers,
+                "balance_sheet",
+                period=period,
+                force_update=force_update,
             )
         if candles_df is None:
-            candles_df = self.candles.get_candles(tickers)
+            candles_df = self.candles.get_candles(tickers, force_update=force_update)
 
-        date_cols_income = [
-            c for c in income_df.columns if c not in ("ticker", "label")
-        ]
-        date_cols_bs = [
-            c for c in balance_sheet_df.columns if c not in ("ticker", "label")
-        ]
+        date_cols_income = [c for c in income_df.columns if c not in ("ticker", "label")]
+        date_cols_bs = [c for c in balance_sheet_df.columns if c not in ("ticker", "label")]
         # Income Statement
         REVENUE = "Total Revenue"
         COGS = "Cost Of Revenue"
         NET_INCOME = "Net Income Common Stockholders"
         EBITDA = "EBITDA"
         SHARES = "Diluted Average Shares"
-        # Balance Sheet 
+        # Balance Sheet
         TOTAL_DEBT = "Total Debt"
         AR = "Accounts Receivable"
         AP = "Accounts Payable"
@@ -322,7 +384,7 @@ class Statements:
                     vals = row.select(date_cols_income).row(0)
                     rolling = {}
                     for i, d in enumerate(date_cols_income):
-                        window = [v for v in vals[max(0, i - 3):i + 1] if v is not None]
+                        window = [v for v in vals[max(0, i - 3) : i + 1] if v is not None]
                         # TTM needs a full 4 quarters; partial sums understate the year
                         rolling[d] = sum(window) if len(window) == 4 else None
                     avg_values[(ticker, lookup_key)] = rolling
@@ -333,7 +395,7 @@ class Statements:
                     vals = row.select(date_cols_bs).row(0)
                     rolling = {}
                     for i, d in enumerate(date_cols_bs):
-                        window = [v for v in vals[max(0, i - 3):i + 1] if v is not None]
+                        window = [v for v in vals[max(0, i - 3) : i + 1] if v is not None]
                         rolling[d] = sum(window) / len(window) if window else None
                     avg_values[(ticker, lookup_key)] = rolling
 
@@ -344,9 +406,7 @@ class Statements:
             bs = balance_sheet_df.filter(pl.col("ticker") == ticker)
 
             prices = (
-                candles_df.filter(pl.col("ticker") == ticker)
-                .sort("date")
-                .select(["date", "close"])
+                candles_df.filter(pl.col("ticker") == ticker).sort("date").select(["date", "close"])
             )
             price_dates = prices["date"].to_list()
             price_closes = prices["close"].to_list()
@@ -386,9 +446,6 @@ class Statements:
             date_cols = [c for c in date_cols_income if c in date_cols_bs]
 
             for date_col in date_cols:
-                revenue = get_val(inc, REVENUE, date_col)
-                net_income = get_val(inc, NET_INCOME, date_col)
-                ebitda = get_val(inc, EBITDA, date_col)
                 shares = get_val(inc, SHARES, date_col)
                 total_debt = get_val(bs, TOTAL_DEBT, date_col)
                 equity = get_val(bs, STOCKHOLDERS_EQUITY, date_col)
@@ -414,8 +471,6 @@ class Statements:
                     if period == "Q"
                     else get_val(bs, AP, date_col)
                 )
-                   
-
 
                 price = get_closest_price(date_col)
 
@@ -430,19 +485,19 @@ class Statements:
                     if period == "Q"
                     else get_val(inc, COGS, date_col)
                 )
-                #ann_revenue = revenue * annualize if revenue else None
+                # ann_revenue = revenue * annualize if revenue else None
                 ann_net_income = (
                     avg_values.get((ticker, "net_income"), {}).get(date_col)
                     if period == "Q"
                     else get_val(inc, NET_INCOME, date_col)
                 )
-                #ann_net_income = net_income * annualize if net_income else None
+                # ann_net_income = net_income * annualize if net_income else None
                 ann_ebitda = (
                     avg_values.get((ticker, "ebitda"), {}).get(date_col)
                     if period == "Q"
                     else get_val(inc, EBITDA, date_col)
                 )
-                #ann_ebitda = ebitda * annualize if ebitda else None
+                # ann_ebitda = ebitda * annualize if ebitda else None
 
                 # P/E
                 if price and shares and ann_net_income:
@@ -486,7 +541,7 @@ class Statements:
                 # EV/EBITDA
                 if price and shares and ann_ebitda and total_debt is not None:
                     market_cap = price * shares
-                    ev = market_cap + (total_debt or 0)
+                    ev = market_cap + (total_debt or 0) - (cash_and_cash_equivalents or 0)
                     if ann_ebitda != 0:
                         results.append(
                             {
@@ -570,8 +625,8 @@ class Statements:
                             "ratio_name": "Inventory Turnover",
                             "value": ann_cogs / inventory,
                         }
-                    )   
-                # Recievables Turnover 
+                    )
+                # Recievables Turnover
                 if ann_revenue and ar:
                     results.append(
                         {
@@ -642,8 +697,6 @@ class Statements:
 
         return pl.DataFrame(results)
 
-
-
     def get_per_share(self, tickers: list[str], period: str = "A"):
         income_statement = self.get_statement(
             tickers=tickers, statement="income_statement", period=period
@@ -651,18 +704,13 @@ class Statements:
         balance_sheet = self.get_statement(
             tickers=tickers, statement="balance_sheet", period=period
         )
-        cash_flow = self.get_statement(
-            tickers=tickers, statement="cash_flow", period=period
-        )
+        cash_flow = self.get_statement(tickers=tickers, statement="cash_flow", period=period)
         date_cols = [c for c in income_statement.columns if c not in ("ticker", "label")]
         SHARES = "Diluted Average Shares"
         per_share_map = {
             "revenue_per_share": ("Total Revenue", SHARES, "income_statement"),
             "operating_income_per_share": ("Operating Income", SHARES, "income_statement"),
-            "net_income_per_share": (
-                "Net Income", 
-                SHARES, "income_statement"
-            ),
+            "net_income_per_share": ("Net Income", SHARES, "income_statement"),
             "ebitda_per_share": ("EBITDA", SHARES, "income_statement"),
             # Balance Sheet
             "cash_per_share": ("Cash And Cash Equivalents", SHARES, "balance_sheet"),
@@ -679,11 +727,15 @@ class Statements:
             ticker_bal_df = balance_sheet.filter(pl.col("ticker") == ticker)
             ticker_cf_df = cash_flow.filter(pl.col("ticker") == ticker)
 
-            for per_share_label, (numerator_label, denominator_label, statement) in per_share_map.items():
+            for per_share_label, (
+                numerator_label,
+                denominator_label,
+                statement,
+            ) in per_share_map.items():
                 den_row = ticker_inc_df.filter(pl.col("label") == denominator_label)
                 if statement == "income_statement":
                     num_row = ticker_inc_df.filter(pl.col("label") == numerator_label)
-                    
+
                 elif statement == "balance_sheet":
                     num_row = ticker_bal_df.filter(pl.col("label") == numerator_label)
                 elif statement == "cash_flow":
@@ -709,7 +761,6 @@ class Statements:
                         )
 
         return pl.DataFrame(results)
-        
 
     def get_growth_values(self, tickers: list[str], period: str = "A"):
         income_statement = self.get_statement(
@@ -718,9 +769,7 @@ class Statements:
         balance_sheet = self.get_statement(
             tickers=tickers, statement="balance_sheet", period=period
         )
-        cash_flow = self.get_statement(
-            tickers=tickers, statement="cash_flow", period=period
-        )
+        cash_flow = self.get_statement(tickers=tickers, statement="cash_flow", period=period)
 
         growth_labels = {
             # Income Statement
@@ -755,16 +804,12 @@ class Statements:
         for ticker in tickers:
             for growth_name, (source, label) in growth_labels.items():
                 df = source_map[source]
-                row = df.filter(
-                    (pl.col("ticker") == ticker) & (pl.col("label") == label)
-                )
+                row = df.filter((pl.col("ticker") == ticker) & (pl.col("label") == label))
                 if row.is_empty():
                     continue
 
                 # Each statement pivot can carry its own set of date columns
-                src_date_cols = sorted(
-                    c for c in df.columns if c not in ("ticker", "label")
-                )
+                src_date_cols = sorted(c for c in df.columns if c not in ("ticker", "label"))
                 for i in range(lookback, len(src_date_cols)):
                     current_col = src_date_cols[i]
                     prior_col = src_date_cols[i - lookback]
@@ -789,19 +834,15 @@ class Statements:
         # Add FCF Growth (computed from two cash flow items)
         for ticker in tickers:
             ocf_row = cash_flow.filter(
-                (pl.col("ticker") == ticker)
-                & (pl.col("label") == "Operating Cash Flow")
+                (pl.col("ticker") == ticker) & (pl.col("label") == "Operating Cash Flow")
             )
             capex_row = cash_flow.filter(
-                (pl.col("ticker") == ticker)
-                & (pl.col("label") == "Capital Expenditure")
+                (pl.col("ticker") == ticker) & (pl.col("label") == "Capital Expenditure")
             )
             if ocf_row.is_empty() or capex_row.is_empty():
                 continue
 
-            cf_date_cols = sorted(
-                c for c in cash_flow.columns if c not in ("ticker", "label")
-            )
+            cf_date_cols = sorted(c for c in cash_flow.columns if c not in ("ticker", "label"))
             for i in range(lookback, len(cf_date_cols)):
                 current_col = cf_date_cols[i]
                 prior_col = cf_date_cols[i - lookback]

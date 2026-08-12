@@ -1,7 +1,4 @@
 import argparse
-import datetime as dt
-import json
-import sys
 
 from .modules.candles import Candles
 from .modules.earnings import Earnings
@@ -21,27 +18,28 @@ def get_risk_free_rate(candles: Candles) -> float:
 
 def cmd_earnings(args):
     db_path = str(get_db_path())
-    earnings = Earnings(db_path)
     tickers = clean_tickers([args.ticker])
-    type_map = {
-        "dates": earnings.get_earnings_dates,
-        "estimates": earnings.get_earnings_estimates,
-        "history": earnings.get_earnings_history,
-    }
-    df = type_map[args.type](tickers)
+    with Earnings(db_path) as earnings:
+        type_map = {
+            "dates": earnings.get_earnings_dates,
+            "estimates": earnings.get_earnings_estimates,
+            "history": earnings.get_earnings_history,
+        }
+        df = type_map[args.type](tickers, force_update=args.force_update)
     print(df)
 
 
 def cmd_get_candles(args):
     db_path = str(get_db_path())
-    candles = Candles(db_path, debug=False)
     tickers = clean_tickers(args.symbols)
 
-    df = candles.get_candles(
-        tickers,
-        interval=args.interval,
-        period=args.range,
-    )
+    with Candles(db_path, debug=False) as candles:
+        df = candles.get_candles(
+            tickers,
+            interval=args.interval,
+            period=args.range,
+            force_update=args.force_update,
+        )
 
     if args.indicators:
         df = add_indicators(df)
@@ -51,21 +49,32 @@ def cmd_get_candles(args):
 
 def cmd_options(args):
     db_path = str(get_db_path())
-    options = Options(db_path)
     tickers = clean_tickers(args.symbols)
 
-    df = options.get_options(tickers, get_latest=True)
+    with Options(db_path) as options:
+        df = options.get_options(tickers, get_latest=True)
     print(df)
 
 
 def cmd_options_screener(args):
     db_path = str(get_db_path())
-    options = Options(db_path)
     tickers = clean_tickers(args.symbols)
 
-    options_df = options.get_options(
-        tickers, get_latest=True, force_update=args.force_update
-    )
+    if args.update_candles:
+        with Candles(db_path, debug=False) as candles:
+            candles.get_candles(
+                tickers,
+                period="5d",
+                force_update=True,
+            )
+
+    with Options(db_path) as options:
+        options_df = options.get_options_by_dte_range(
+            tickers,
+            min_dte=args.min_dte,
+            max_dte=args.max_dte,
+            force_update=args.force_update,
+        )
 
     results = options_screener(
         options_df,
@@ -76,6 +85,10 @@ def cmd_options_screener(args):
         min_collateral=args.min_collateral,
         max_collateral=args.max_collateral,
     )
+
+    if results.is_empty():
+        print(results)
+        return
 
     print(
         results.select(
@@ -98,10 +111,8 @@ def cmd_options_screener(args):
 
 def cmd_statements(args):
     db_path = str(get_db_path())
-    statements = Statements(db_path)
-    candles = Candles(db_path, debug=False)
     tickers = clean_tickers(args.symbols)
-    period = "A" if args.annual else "Q"
+    period = args.period
 
     type_map = {
         "income": "income_statement",
@@ -110,31 +121,57 @@ def cmd_statements(args):
     }
     statement_type = type_map.get(args.statement_type, args.statement_type)
 
-    if args.ratios:
-        # get_statement returns the pivoted (ticker, label, dates...) frame
-        income_pivoted = statements.get_statement(tickers, "income_statement", period)
-        balance_pivoted = statements.get_statement(tickers, "balance_sheet", period)
-        candles_df = candles.get_candles(tickers)
-        ratios = statements.get_ratios(
-            tickers,
-            income_df=income_pivoted,
-            balance_sheet_df=balance_pivoted,
-            candles_df=candles_df,
-            period=period,
-        )
-        print(ratios)
+    with Candles(db_path, debug=False) as candles:
+        with Statements(db_path, candles_obj=candles) as statements:
+            if args.ratios:
+                # get_statement returns the pivoted (ticker, label, dates...) frame
+                income_pivoted = statements.get_statement(
+                    tickers,
+                    "income_statement",
+                    period,
+                    force_update=args.force_update,
+                )
+                balance_pivoted = statements.get_statement(
+                    tickers,
+                    "balance_sheet",
+                    period,
+                    force_update=args.force_update,
+                )
+                candles_df = candles.get_candles(tickers, force_update=args.force_update)
+                ratios = statements.get_ratios(
+                    tickers,
+                    income_df=income_pivoted,
+                    balance_sheet_df=balance_pivoted,
+                    candles_df=candles_df,
+                    period=period,
+                )
+                print(ratios)
 
-    elif args.margins:
-        print(statements.get_margins(tickers, period))
+            elif args.margins:
+                print(
+                    statements.get_margins(
+                        tickers,
+                        period,
+                        force_update=args.force_update,
+                    )
+                )
 
-    else:
-        print(statements.get_statement(tickers, statement_type, period))
+            else:
+                print(
+                    statements.get_statement(
+                        tickers,
+                        statement_type,
+                        period,
+                        force_update=args.force_update,
+                    )
+                )
 
 
 def cmd_info(args):
     db_path = str(get_db_path())
     ticker = clean_tickers([args.ticker])[0]
-    print(Ticker(ticker, db_path=db_path).info)
+    with Ticker(ticker, db_path=db_path) as ticker_obj:
+        print(ticker_obj.info)
 
 
 def main():
@@ -145,6 +182,7 @@ def main():
     p_earnings = subparsers.add_parser("earnings")
     p_earnings.add_argument("-t", "--ticker", required=True)
     p_earnings.add_argument("--type", choices=["dates", "estimates", "history"], default="dates")
+    p_earnings.add_argument("--force-update", action="store_true")
     p_earnings.set_defaults(func=cmd_earnings)
 
     # get-candles
@@ -178,10 +216,13 @@ def main():
     p_statements = subparsers.add_parser("statements")
     p_statements.add_argument("symbols", nargs="+")
     p_statements.add_argument("-s", "--statement-type", default="income")
-    p_statements.add_argument("-a", "--annual", action="store_true")
-    p_statements.add_argument("-q", "--quarterly", action="store_true")
+    period_group = p_statements.add_mutually_exclusive_group()
+    period_group.add_argument("-a", "--annual", dest="period", action="store_const", const="A")
+    period_group.add_argument("-q", "--quarterly", dest="period", action="store_const", const="Q")
+    p_statements.set_defaults(period="A")
     p_statements.add_argument("-m", "--margins", action="store_true")
     p_statements.add_argument("-r", "--ratios", action="store_true")
+    p_statements.add_argument("--force-update", action="store_true")
     p_statements.set_defaults(func=cmd_statements)
 
     # info
